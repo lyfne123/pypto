@@ -59,7 +59,7 @@ class TestOrchestration:
     """Test orchestration codegen format."""
 
     def test_basic_structure(self):
-        """Test codegen produces PTO2 format: make_tensor_external, Arg, pto2_rt_submit_aiv_task."""
+        """Test codegen produces PTO2 format: make_tensor_external, Arg, rt_submit_aiv_task."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
 
@@ -127,14 +127,14 @@ class TestOrchestration:
                     params_t0.add_input(ext_a);
                     params_t0.add_input(ext_b);
                     params_t0.add_output(c);
-                    pto2_rt_submit_aiv_task(0, params_t0);
+                    rt_submit_aiv_task(0, params_t0);
 
                     // Task 1: kernel_add
                     Arg params_t1;
                     params_t1.add_input(c);
                     params_t1.add_input(ext_b);
                     params_t1.add_output(ext_d);
-                    pto2_rt_submit_aiv_task(0, params_t1);
+                    rt_submit_aiv_task(0, params_t1);
                 }
             }
 
@@ -256,7 +256,7 @@ class TestOrchestration:
         assert "from_tensor_arg(" in code
 
         # Two tasks submitted
-        assert code.count("pto2_rt_submit_aiv_task") == 2
+        assert code.count("rt_submit_aiv_task") == 2
 
         # PTO2_SCOPE wraps all task submissions
         assert "PTO2_SCOPE" in code
@@ -379,35 +379,35 @@ class TestOrchestration:
                     params_t0.add_input(ext_a);
                     params_t0.add_input(ext_b);
                     params_t0.add_output(c);
-                    pto2_rt_submit_aiv_task(0, params_t0);
+                    rt_submit_aiv_task(0, params_t0);
 
                     // Task 1: kernel_add_scalar
                     Arg params_t1;
                     params_t1.add_input(c);
                     params_t1.add_output(d);
                     params_t1.add_scalar(to_u64(1.000000f));
-                    pto2_rt_submit_aiv_task(1, params_t1);
+                    rt_submit_aiv_task(1, params_t1);
 
                     // Task 2: kernel_add_scalar
                     Arg params_t2;
                     params_t2.add_input(c);
                     params_t2.add_output(e);
                     params_t2.add_scalar(to_u64(2.000000f));
-                    pto2_rt_submit_aiv_task(1, params_t2);
+                    rt_submit_aiv_task(1, params_t2);
 
                     // Task 3: kernel_mul
                     Arg params_t3;
                     params_t3.add_input(d);
                     params_t3.add_input(e);
                     params_t3.add_output(g);
-                    pto2_rt_submit_aiv_task(2, params_t3);
+                    rt_submit_aiv_task(2, params_t3);
 
                     // Task 4: kernel_add
                     Arg params_t4;
                     params_t4.add_input(g);
                     params_t4.add_input(c);
                     params_t4.add_output(ext_f);
-                    pto2_rt_submit_aiv_task(0, params_t4);
+                    rt_submit_aiv_task(0, params_t4);
                 }
             }
 
@@ -475,7 +475,7 @@ class TestOrchestration:
         assert "from_tensor_arg(orch_args.tensor(2))" in code
 
         # Two tasks: kernel_pair + kernel_add
-        assert code.count("pto2_rt_submit_aiv_task") == 2
+        assert code.count("rt_submit_aiv_task") == 2
 
         # PTO2_SCOPE wraps all task submissions
         assert "PTO2_SCOPE" in code
@@ -523,7 +523,7 @@ class TestOrchestration:
         assert "from_tensor_arg(orch_args.tensor(3))" in code
 
         # Only one task: kernel_pair
-        assert code.count("pto2_rt_submit_aiv_task") == 1
+        assert code.count("rt_submit_aiv_task") == 1
 
         # PTO2_SCOPE wraps all task submissions
         assert "PTO2_SCOPE" in code
@@ -604,7 +604,7 @@ class TestOrchestration:
         assert "Tensor ext_final = from_tensor_arg(orch_args.tensor(7))" in code
 
         # Two tasks: online_update + kernel_add
-        assert code.count("pto2_rt_submit_aiv_task") == 2
+        assert code.count("rt_submit_aiv_task") == 2
 
         # online_update: 3 In + 3 InOut + 1 Out = 7 params
         assert "params_t0.add_input(ext_mij)" in code
@@ -752,7 +752,7 @@ class TestOrchestration:
                     params_t0.add_inout(ext_li);
                     params_t0.add_inout(ext_oi);
                     params_t0.add_output(ext_dst);
-                    pto2_rt_submit_aiv_task(0, params_t0);
+                    rt_submit_aiv_task(0, params_t0);
                 }
             }
 
@@ -852,7 +852,7 @@ class TestOrchestration:
         assert "static_cast<int64_t*>(orch_args.tensor(2).data_as<void>())" in code
 
         # kernel_add task submitted inside loop
-        assert "pto2_rt_submit_aiv_task" in code
+        assert "rt_submit_aiv_task" in code
 
     def test_tensor_slice_with_valid_shape(self):
         """tensor.slice(valid_shape=...) should still emit a runtime tensor view."""
@@ -997,7 +997,7 @@ class TestOrchestration:
                 in_task0 = True
             elif "Arg params_t1" in line:
                 in_task1 = True
-            elif "pto2_rt_submit" in line:
+            elif "rt_submit" in line:
                 in_task0 = False
                 in_task1 = False
             if in_task0 and ("params_t0.add_" in line):
@@ -1097,7 +1097,7 @@ class TestOrchestration:
         # Both tasks submitted
         assert "kernel_init" in code
         assert "kernel_update" in code
-        assert code.count("pto2_rt_submit_aiv_task") == 2
+        assert code.count("rt_submit_aiv_task") == 2
 
     def test_loop_carried_internal_tensor_uses_hoisted_state_after_loop(self):
         """Loop-carried internal tensors should remain consumable after the loop."""
@@ -1876,7 +1876,7 @@ class TestTensorReadWriteOffsetCodegen:
         code = _generate_orch_code(transformed)
 
         # Two tasks: mixed_kernel + consumer
-        assert code.count("pto2_rt_submit_aiv_task") == 2
+        assert code.count("rt_submit_aiv_task") == 2
 
         # The mixed kernel returns a tuple of (acc, dst).
         # acc comes from tile.store to an acc Out param.
@@ -1967,7 +1967,7 @@ class TestTensorReadWriteOffsetCodegen:
         )
 
         assert f"MixedKernels mixed_0 = {{{expected_ids[0]}, {expected_ids[1]}, {expected_ids[2]}}};" in code
-        assert "pto2_rt_submit_task(mixed_0, params_t0);" in code
+        assert "rt_submit_task(mixed_0, params_t0);" in code
 
 
 class TestSpmdLaunch:
@@ -1999,7 +1999,7 @@ class TestSpmdLaunch:
 
         code = _generate_orch_code(SpmdProgram)
         assert "launch_spec.set_block_num(8)" in code
-        assert "pto2_rt_submit_aiv_task" in code
+        assert "rt_submit_aiv_task" in code
 
     def test_spmd_launch_core_num_and_sync_start(self):
         """spmd_launch with both core_num and sync_start emits both launch_spec calls."""

@@ -134,10 +134,10 @@ bool RequiresDualAivDispatch(const FunctionPtr& aiv_func) {
          aiv_func->GetSplitMode().value() != SplitMode::None;
 }
 
-// Returns the opening of a pto2_rt_submit_{aic,aiv}_task call.
+// Returns the opening of a rt_submit_{aic,aiv}_task call.
 // Caller appends: func_id << ", " << params << ");".
 std::string CoreTypeToSubmitPrefix(CoreType core_type) {
-  std::string func = core_type == CoreType::CUBE ? "pto2_rt_submit_aic_task" : "pto2_rt_submit_aiv_task";
+  std::string func = core_type == CoreType::CUBE ? "rt_submit_aic_task" : "rt_submit_aiv_task";
   return func + "(";
 }
 
@@ -744,8 +744,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     code_ << ind << "MixedKernels mixed_" << task_counter_ << " = {" << aic_id << ", " << aiv_id << ", "
           << third_id << "};\n";
 
-    std::string submit_expr =
-        "pto2_rt_submit_task(mixed_" + std::to_string(task_counter_) + ", " + task_var + ")";
+    std::string submit_expr = "rt_submit_task(mixed_" + std::to_string(task_counter_) + ", " + task_var + ")";
     EmitTaskSubmitAndBind(submit_expr);
   }
 
