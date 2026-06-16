@@ -1196,201 +1196,127 @@ bool NeedsLoadTpopHazardGuard(const FunctionPtr& func) {
   return split_mode.has_value() && *split_mode != SplitMode::None;
 }
 
+/// Can the candidate interval `cand` share a single physical buffer that
+/// already holds `member`?  Encapsulates every pairwise reuse constraint so the
+/// global packer below can ask it against each existing buffer member:
+///   1. lifetimes must not overlap (touching is allowed: a buffer's reader is
+///      consumed before the writer at the same statement produces its output);
+///   2. storage attributes must be compatible -- L0 cube-input view buffers
+///      (Left/Right) may share across differing shapes (byte size is always
+///      sufficient because the packer never admits a member larger than the
+///      representative); all other spaces keep the strict shape/dtype/view match;
+///   3. the Ascend910B load + tpop_from_aic in-place hazard must not form;
+///      `hazard` is empty off-910B so this is then a no-op;
+///   4. an in-place-unsafe op must not land src==dst.
+///
+/// Constraints 3 and 4 are directional ("the op defined exactly at the other
+/// interval's last use reads it in place").  The former definition-order greedy
+/// only needed the forward direction because `cand` was always defined after
+/// every candidate buffer member; the size-ordered packer processes intervals
+/// out of program order, so both directions are checked.
+static bool CanShareBuffer(const LifetimeInterval& cand, const LifetimeInterval& member,
+                           const HazardInputs& hazard) {
+  if (LifetimesOverlap(cand, member)) return false;
+
+  const MemorySpace space = cand.memory_space;
+  const bool l0_byte_reuse = (space == MemorySpace::Left || space == MemorySpace::Right) &&
+                             IsL0ViewProducerOp(cand.def_op_name) && IsL0ViewProducerOp(member.def_op_name);
+  if (!l0_byte_reuse && !AreTileTypesCompatible(cand.variable, member.variable)) return false;
+
+  // Ascend910B split-AIV load + tpop_from_aic hazard: a writer that consumes a
+  // tile.load result (or a view of one) AND a tile.tpop_from_aic value must not
+  // write its output into the load result's buffer.  `writer` is the interval
+  // defined exactly where `input` is last read -- the in-place touch point.
+  auto hazard_blocks = [&hazard](const LifetimeInterval& writer, const LifetimeInterval& input) {
+    return writer.def_point == input.last_use_point && hazard.reads_tpop.count(writer.variable.get()) != 0 &&
+           hazard.load_derived.count(input.variable.get()) != 0;
+  };
+  if (hazard_blocks(cand, member) || hazard_blocks(member, cand)) return false;
+
+  // In-place safety: an op that cannot execute src==dst must not be defined onto
+  // a buffer still occupied by an interval whose last use is that op's def.
+  auto inplace_blocks = [](const LifetimeInterval& writer, const LifetimeInterval& input) {
+    if (writer.def_point != input.last_use_point || writer.def_op_name.empty()) return false;
+    auto& registry = OpRegistry::GetInstance();
+    return registry.IsRegistered(writer.def_op_name) &&
+           !registry.GetEntry(writer.def_op_name).IsInplaceSafe();
+  };
+  if (inplace_blocks(cand, member) || inplace_blocks(member, cand)) return false;
+
+  return true;
+}
+
 /**
- * @brief Identify memory reuse opportunities from lifetime intervals
+ * @brief Identify memory reuse opportunities from lifetime intervals.
+ *
+ * Global first-fit-decreasing packing: within each memory space, intervals are
+ * placed largest-first, and every later interval joins the first existing buffer
+ * all of whose members it can share with (CanShareBuffer).  A buffer's allocated
+ * size is fixed by its first (largest) member, so admitting a smaller member
+ * afterwards is free -- which makes first-fit cost-optimal for this objective
+ * and, crucially, lets a *later, larger* interval host an *earlier, smaller*
+ * one.  The former definition-order greedy could only let a smaller interval
+ * reuse an earlier, larger buffer (its size gate `source.size >= target.size`
+ * was one-directional), so two disjoint L0 cube-input tiles whose small one is
+ * defined first were never coalesced.
+ *
+ * The representative (each buffer's first/largest member) is the MemRef every
+ * other member is rebased onto downstream; its alloc dominates the whole
+ * function (InitMemRef hoists every tile.alloc to the function-body head), so a
+ * representative defined after some of its members is safe.
  *
  * @param hazard  Ascend910B load + tpop_from_aic guard inputs.  Empty when the
  *                guard is inactive (non-910B / non-split-AIV), in which case the
- *                hazard check below is a no-op and reuse behaviour is unchanged.
+ *                hazard check is a no-op and reuse behaviour is unchanged.
+ *
+ * Complexity: O(M log M) sort + O(M^2) worst-case pairwise checks over M tile
+ * intervals (M is a subset of the N IR nodes) -- the same class as the prior
+ * greedy implementation.
  */
 std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(const std::vector<LifetimeInterval>& lifetimes,
                                                     const HazardInputs& hazard) {
   std::map<VarPtr, VarPtr> reuse_map;
 
-  // Build a fast lookup map: VarPtr -> LifetimeInterval for O(1) access
-  // This avoids repeated std::find_if calls which were O(n)
-  std::map<VarPtr, const LifetimeInterval*> var_to_lifetime;
-  for (const auto& interval : lifetimes) {
-    var_to_lifetime[interval.variable] = &interval;
+  // Group interval indices by memory space -- reuse only happens within a space.
+  std::map<MemorySpace, std::vector<size_t>> by_space;
+  for (size_t i = 0; i < lifetimes.size(); ++i) {
+    by_space[lifetimes[i].memory_space].push_back(i);
   }
 
-  // Track which variables are reusing each source variable's MemRef
-  // This is critical to avoid multiple variables with overlapping lifetimes
-  // sharing the same MemRef, which would cause memory corruption
-  std::map<VarPtr, std::vector<VarPtr>> memref_users;  // source_var -> list of vars reusing it
+  for (auto& [space, indices] : by_space) {
+    (void)space;
+    // Largest-first; ties broken by definition order for determinism and so that
+    // equal-size workloads reproduce the prior definition-order grouping.
+    std::stable_sort(indices.begin(), indices.end(), [&lifetimes](size_t a, size_t b) {
+      if (lifetimes[a].size != lifetimes[b].size) return lifetimes[a].size > lifetimes[b].size;
+      return lifetimes[a].def_point < lifetimes[b].def_point;
+    });
 
-  // Group variables by memory_space (preserve order within each group)
-  std::map<MemorySpace, std::vector<size_t>> groups;  // memory_space -> indices in lifetimes
-  for (size_t i = 0; i < lifetimes.size(); i++) {
-    groups[lifetimes[i].memory_space].push_back(i);
-  }
-
-  // For each memory space, find reuse opportunities
-  for (auto& [space, indices] : groups) {
-    // Greedy matching: for each variable, try to reuse from previous variables
-    for (size_t i = 1; i < indices.size(); i++) {
-      size_t curr_idx = indices[i];
-      const auto& curr_lifetime = lifetimes[curr_idx];
-      VarPtr curr_var = curr_lifetime.variable;
-
-      // Find best candidate to reuse from (earliest with sufficient size)
-      for (size_t j = 0; j < i; j++) {
-        size_t prev_idx = indices[j];
-        const auto& prev_lifetime = lifetimes[prev_idx];
-        VarPtr prev_var = prev_lifetime.variable;
-
-        // Check if lifetimes overlap with source variable.
-        // Use <= to allow "touching" lifetimes (last_use == def_point) to be
-        // merged: within a single statement, inputs are consumed before outputs
-        // are produced, so a variable whose last use is in the same statement as
-        // another variable's definition can safely share the same buffer.
-        bool overlaps_with_source = LifetimesOverlap(prev_lifetime, curr_lifetime);
-
-        // Check if size is sufficient
-        bool size_ok = prev_lifetime.size >= curr_lifetime.size;
-
-        if (overlaps_with_source || !size_ok) {
-          continue;  // Cannot reuse due to overlap with source or insufficient size
-        }
-
-        // Compatibility gate.  L0 cube-input buffers (Left/Right) hold sub-tiles
-        // produced by PTO view ops (tile.extract / tile.slice / tile.reshape),
-        // which codegen materialises per tile var at the buffer base — so two
-        // non-overlapping sub-tiles of *different* shapes can legally share one
-        // L0A/L0B slot (byte-size sufficiency is enforced by `size_ok` above).
-        // This lets fused-attention reuse the QK Right buffer ([k, SEQ]) for the
-        // PV Right buffer ([k', HEAD]).  All other spaces keep the strict per-var
-        // alloc_tile signature match so reuse cannot create a codegen conflict.
-        const bool l0_byte_reuse = (space == MemorySpace::Left || space == MemorySpace::Right) &&
-                                   IsL0ViewProducerOp(curr_lifetime.def_op_name) &&
-                                   IsL0ViewProducerOp(prev_lifetime.def_op_name);
-        if (!l0_byte_reuse && !AreTileTypesCompatible(curr_var, prev_var)) {
-          continue;
-        }
-
-        // CRITICAL: Check if current variable's lifetime overlaps with ANY variable
-        // that is already reusing the same MemRef (transitive reuse check).
-        // Follow the reuse chain to the root, since all variables in the chain
-        // share the same physical MemRef.
-        VarPtr root = prev_var;
-        while (reuse_map.count(root)) {
-          root = reuse_map.at(root);
-        }
-        bool overlaps_with_users = false;
-        // When prev_var itself reuses another variable, we must also check
-        // against root (the ultimate MemRef owner) since it's not tracked
-        // in memref_users.
-        if (root != prev_var) {
-          const LifetimeInterval* root_lifetime = var_to_lifetime[root];
-          if (root_lifetime) {
-            bool overlaps = LifetimesOverlap(*root_lifetime, curr_lifetime);
-            if (overlaps) {
-              overlaps_with_users = true;
-              LOG_DEBUG << "Variable " << curr_var->name_hint_ << " cannot reuse " << prev_var->name_hint_
-                        << " due to overlap with root MemRef owner " << root->name_hint_;
-            }
+    // Each buffer is a list of interval indices sharing one MemRef; element 0 is
+    // the representative (largest, earliest on ties) every member is rebased to.
+    std::vector<std::vector<size_t>> buffers;
+    for (size_t idx : indices) {
+      const auto& cand = lifetimes[idx];
+      bool placed = false;
+      for (auto& buf : buffers) {
+        bool fits = true;
+        for (size_t member_idx : buf) {
+          if (!CanShareBuffer(cand, lifetimes[member_idx], hazard)) {
+            fits = false;
+            break;
           }
         }
-        if (!overlaps_with_users && memref_users.count(root)) {
-          for (const auto& user_var : memref_users[root]) {
-            if (user_var == prev_var) continue;  // Already checked in source overlap
-            const LifetimeInterval* user_lifetime = var_to_lifetime[user_var];
-            if (user_lifetime) {
-              bool overlaps = LifetimesOverlap(*user_lifetime, curr_lifetime);
-
-              if (overlaps) {
-                overlaps_with_users = true;
-                LOG_DEBUG << "Variable " << curr_var->name_hint_ << " cannot reuse " << prev_var->name_hint_
-                          << " due to overlap with existing user " << user_var->name_hint_ << " (lifetime ["
-                          << curr_lifetime.def_point << ", " << curr_lifetime.last_use_point << "] vs ["
-                          << user_lifetime->def_point << ", " << user_lifetime->last_use_point << "])";
-                break;
-              }
-            }
-          }
-        }
-
-        if (!overlaps_with_users) {
-          // Ascend910B split-AIV hazard: a writer that consumes a tile.load
-          // result (or a view of one) AND a tile.tpop_from_aic value must not
-          // place its output in the same buffer as that load result.  The
-          // occupied buffer member whose last use is curr_var's def is exactly
-          // the input the writer reads in place; if it is load-derived and
-          // curr_var's def also consumes a tpop value, block the reuse so the
-          // hazardous sharing is never formed.  `hazard` is empty off-910B, so
-          // this whole block is a no-op for every other backend.
-          if (hazard.reads_tpop.count(curr_var.get()) != 0) {
-            bool load_tpop_conflict = false;
-            const LifetimeInterval* root_lt =
-                var_to_lifetime.count(root) ? var_to_lifetime.at(root) : nullptr;
-            if (root_lt && root_lt->last_use_point == curr_lifetime.def_point &&
-                hazard.load_derived.count(root.get()) != 0) {
-              load_tpop_conflict = true;
-            }
-            if (!load_tpop_conflict && memref_users.count(root)) {
-              for (const auto& user_var : memref_users.at(root)) {
-                const LifetimeInterval* user_lt =
-                    var_to_lifetime.count(user_var) ? var_to_lifetime.at(user_var) : nullptr;
-                if (user_lt && user_lt->last_use_point == curr_lifetime.def_point &&
-                    hazard.load_derived.count(user_var.get()) != 0) {
-                  load_tpop_conflict = true;
-                  break;
-                }
-              }
-            }
-            if (load_tpop_conflict) {
-              LOG_DEBUG << "Variable " << curr_var->name_hint_ << " cannot reuse " << prev_var->name_hint_
-                        << " (Ascend910B load + tpop_from_aic in-place hazard)";
-              continue;
-            }
-          }
-
-          // For inplace-unsafe ops (src buffer == dst buffer not supported), block reuse
-          // whenever the buffer is still occupied at curr_var's definition statement.
-          // A conflict exists if root or any variable sharing root's buffer has
-          // last_use == curr_var.def — meaning it is still being read as an input
-          // to the inplace-unsafe op that defines curr_var (src == dst).
-          if (!curr_lifetime.def_op_name.empty()) {
-            auto& registry = OpRegistry::GetInstance();
-            if (registry.IsRegistered(curr_lifetime.def_op_name) &&
-                !registry.GetEntry(curr_lifetime.def_op_name).IsInplaceSafe()) {
-              // Check root (the ultimate buffer owner)
-              const LifetimeInterval* root_lifetime =
-                  var_to_lifetime.count(root) ? var_to_lifetime.at(root) : nullptr;
-              bool inplace_conflict =
-                  root_lifetime && root_lifetime->last_use_point == curr_lifetime.def_point;
-
-              // Check all variables sharing root's buffer
-              if (!inplace_conflict && memref_users.count(root)) {
-                for (const auto& user_var : memref_users.at(root)) {
-                  const LifetimeInterval* user_lifetime =
-                      var_to_lifetime.count(user_var) ? var_to_lifetime.at(user_var) : nullptr;
-                  if (user_lifetime && user_lifetime->last_use_point == curr_lifetime.def_point) {
-                    inplace_conflict = true;
-                    break;
-                  }
-                }
-              }
-
-              if (inplace_conflict) {
-                LOG_DEBUG << "Variable " << curr_var->name_hint_ << " cannot reuse " << prev_var->name_hint_
-                          << " (op=" << curr_lifetime.def_op_name
-                          << " does not support in-place execution, buffer still occupied at def)";
-                continue;
-              }
-            }
-          }
-
-          // Can safely reuse!
-          reuse_map[curr_var] = prev_var;
-          memref_users[root].push_back(curr_var);  // Track under root MemRef owner
-          LOG_DEBUG << "Variable " << curr_var->name_hint_ << " can reuse " << prev_var->name_hint_
-                    << " (lifetime [" << curr_lifetime.def_point << ", " << curr_lifetime.last_use_point
-                    << "]"
-                    << " vs [" << prev_lifetime.def_point << ", " << prev_lifetime.last_use_point << "])";
-          break;  // Found a reuse target, stop searching
-        }
+        if (!fits) continue;
+        const VarPtr& representative = lifetimes[buf.front()].variable;
+        reuse_map[cand.variable] = representative;  // member -> representative
+        buf.push_back(idx);
+        placed = true;
+        LOG_DEBUG << "Variable " << cand.variable->name_hint_ << " reuses representative "
+                  << representative->name_hint_ << " (lifetime [" << cand.def_point << ", "
+                  << cand.last_use_point << "])";
+        break;
       }
+      if (!placed) buffers.push_back({idx});
     }
   }
 

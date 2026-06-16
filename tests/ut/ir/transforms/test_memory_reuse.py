@@ -2903,8 +2903,10 @@ class TestL0CrossShapeReuse:
     def test_right_buffers_different_shapes_reuse(self):
         """``rb`` ([64, 256] Right) is dead before ``rd`` ([128, 128] Right) is
         born; both are 32 KB extract sub-tiles, so ``rd`` reuses ``rb``'s buffer
-        despite the differing shape.  ``lc`` ([16, 128] Left) is *larger* than
-        ``la`` ([16, 64] Left), so the size gate (correctly) keeps them apart."""
+        despite the differing shape.  ``la`` ([16, 64] Left, 2 KB) is dead before
+        ``lc`` ([16, 128] Left, 4 KB) is born; global largest-first packing makes
+        the larger ``lc`` the buffer representative and lets the smaller, earlier
+        ``la`` share it — cross-shape L0 reuse is bidirectional."""
 
         @pl.program
         class Before:
@@ -2981,10 +2983,14 @@ class TestL0CrossShapeReuse:
             f"rd ([128,128] Right) must reuse rb's ([64,256] Right) buffer; "
             f"got rb@{bases['rb'].name_hint} vs rd@{bases['rd'].name_hint}"
         )
-        # lc ([16,128] Left, 4 KB) is larger than la ([16,64] Left, 2 KB), so the
-        # size gate keeps them in distinct buffers — reuse must not corrupt.
-        assert bases["la"] is not bases["lc"], (
-            "la ([16,64]) and lc ([16,128]) must NOT share — lc is larger (size gate)"
+        # la ([16,64] Left, 2 KB) is dead before lc ([16,128] Left, 4 KB) is born.
+        # Global largest-first packing makes the larger lc the representative and
+        # lets the smaller, earlier la share its buffer — the former one-directional
+        # size gate (source.size >= target.size) could never capture this. Saves 2 KB
+        # of L0A; lc's 4 KB buffer is large enough to hold la.
+        assert bases["la"] is bases["lc"], (
+            "la ([16,64]) should reuse lc's ([16,128]) larger L0A buffer under global "
+            f"packing; got la@{bases['la'].name_hint} vs lc@{bases['lc'].name_hint}"
         )
 
 

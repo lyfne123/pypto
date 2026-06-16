@@ -42,7 +42,7 @@ program_optimized = reuse_pass(program)
 
 1. **生命周期分析**：遍历完整 IR 树（包括嵌套控制流体内的语句）通过 def-use 分析计算变量生命周期。在循环外定义但在循环内使用的变量，其生命周期会延展到循环结束（循环感知延展）
 2. **干涉检查**：识别生命周期重叠的变量
-3. **MemRef 共享**：为同一内存空间中不干涉的变量分配相同的 MemRef 指针
+3. **MemRef 共享**（全局「最大优先 + first-fit」装箱，`IdentifyReuseOpportunities`）：在每个内存空间内，按 **大小从大到小** 装箱；后续每个区间加入第一个其全部成员都能与之共享的缓冲区（生命周期不重叠 + 存储属性兼容 + hazard / in-place 安全，见 `CanShareBuffer`）。缓冲区的分配大小由其首个（最大）成员固定，因此之后纳入更小的成员是「免费」的 —— 且 *后定义的较大区间* 现在可以承载 *先定义的较小区间*。（此前的定义序贪心带有单向的大小门槛 `source.size >= target.size`，因此两个生命周期不相交、但较小者先定义的 L0 cube 输入 tile 永远无法合并。）每个成员被重定位到的「代表」是该缓冲区的最大成员；由于 InitMemRef 会把所有 `tile.alloc` 提升到函数体头部，代表的 alloc 支配整个函数，因此代表即使定义在其部分成员之后也是安全的。
 4. **循环携带变量重对齐**（`AlignLoopCarriesToInitMutator`）：共享（步骤 3）只会重写由 `AssignStmt` 定义的变量（producer/init），而循环携带的 `iter_arg`/`return_var` 节点被排除在生命周期/共享映射之外、仍保留原始 MemRef。本步骤**自外向内**遍历 `ForStmt`，将每个循环的 `iter_arg`/`return_var` 重对齐到其（已复用的）`initValue` 的 MemRef，并在递归前写入 `var_remap_`，使嵌套循环能观察到已修正的外层 `iter_arg` 作为其 init。若缺少本步骤，被复用的**嵌套流水化 `matmul_acc`** 累加器会分裂到两个 Acc 缓冲区，导致步骤 5 插入非法的 `acc→acc tile.move`，被 Ascend 910B 的 ptoas 拒绝（[#1352](https://github.com/hw-native-sys/pypto/issues/1352)）
 5. **Yield 修复**：修复控制流返回变量的 MemRef 不一致：
    - **ForStmt**：确保 4 个循环携带变量（initValue、iter_arg、yield value、return_var）共享同一个 MemRef。若 MemRef 不同则在 yield 前插入 `tile.move`
@@ -53,8 +53,8 @@ program_optimized = reuse_pass(program)
 
 - 生命周期不重叠（无干涉）。当 `prev.last_use <= curr.def` 时，两个变量不重叠（即源的最后使用可以和目标的定义在同一语句，因为在同一语句内输入先于输出被消费）
 - 相同内存空间
-- 大小兼容（复用目标必须足够大）
-- **L0 cube 输入例外（Left/Right）**：`Mem.Left` / `Mem.Right` 的缓冲区存放的是由 view 算子（`tile.extract` / `tile.slice` / `tile.reshape`）产生的子 tile，PTO codegen 会按每个 tile 变量在缓冲区基址处单独物化。因此同一 L0 空间、生命周期不重叠、**字节**大小足够的两个这类缓冲区，即使 **shape 不同**也可以共享同一槽位 —— 对它们跳过下面的 `AreTileTypesCompatible`（shape/dtype/view）检查（前提是两端的 producer 都是 view 算子，即 PTO view 算子，从而共享的 MemRef 保持可被 PTO 物化）。这使 fused-attention 能用 QK 的 `Right` 缓冲区（`[k, SEQ]`）复用 PV 的 `Right` 缓冲区（`[k', HEAD]`），将 L0B 峰值减半（issue #1595）。其它空间（Vec/Acc/Mat）仍保持严格匹配：
+- 缓冲区大小取其**最大**成员；由于按最大优先装箱，后纳入的成员都不大于代表，故无需显式大小检查（复用方向也不再被限制为「先定义且更大」）
+- **L0 cube 输入例外（Left/Right）**：`Mem.Left` / `Mem.Right` 的缓冲区存放的是由 view 算子（`tile.extract` / `tile.slice` / `tile.reshape`）产生的子 tile，PTO codegen 会按每个 tile 变量在缓冲区基址处单独物化。因此同一 L0 空间、生命周期不重叠、**字节**大小足够的两个这类缓冲区，即使 **shape 不同**也可以共享同一槽位 —— 对它们跳过下面的 `AreTileTypesCompatible`（shape/dtype/view）检查（前提是两端的 producer 都是 view 算子，即 PTO view 算子，从而共享的 MemRef 保持可被 PTO 物化）。这使 fused-attention 能用 QK 的 `Right` 缓冲区（`[k, SEQ]`）复用 PV 的 `Right` 缓冲区（`[k', HEAD]`），将 L0B 峰值减半（issue #1595）。采用最大优先装箱后，该复用变为**双向**：先定义的较小 L0 子 tile 也能共享一个后定义、生命周期不相交的较大 L0 子 tile（较大者为代表）。其它空间（Vec/Acc/Mat）仍保持严格匹配：
 - TileType 兼容性 — 由 `AreTileTypesCompatible` 检查：
   - 相同 shape（所有维度必须精确匹配）
   - 相同 dtype（例如 FP32 与 BF16 阻止复用，自动处理 `tile.cast`）
