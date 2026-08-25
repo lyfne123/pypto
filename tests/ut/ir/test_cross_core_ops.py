@@ -147,7 +147,9 @@ def test_cross_core_sync_static_and_dynamic_event_ids():
     """Cross-core sync accepts either a user event id or a dynamic index operand."""
     span = ir.Span.unknown()
 
-    static_set = system_ops.sync_set(3, pipe=ir.PipeType.FIX, ffts_mode=1, core_type="aiv", span=span)
+    static_set = system_ops.sync_set(
+        3, pipe=ir.PipeType.FIX, ffts_mode=1, core_type=system_ops.KernelType.AIV, span=span
+    )
     assert isinstance(static_set.type, ir.UnknownType)
     assert static_set.args == []
     assert static_set.kwargs == {
@@ -158,18 +160,26 @@ def test_cross_core_sync_static_and_dynamic_event_ids():
     }
 
     event_id = ir.Var("event_id", ir.ScalarType(DataType.INDEX), span)
-    dynamic_wait = system_ops.sync_wait(event_id, pipe=ir.PipeType.MTE3, core_type="aic", span=span)
+    dynamic_wait = system_ops.sync_wait(
+        event_id, pipe=ir.PipeType.MTE3, core_type=system_ops.KernelType.AIC, span=span
+    )
     assert isinstance(dynamic_wait.type, ir.UnknownType)
     assert dynamic_wait.args == [event_id]
     assert "event_id" not in dynamic_wait.kwargs
     assert dynamic_wait.kwargs["core_type"] == "aic"
 
 
-@pytest.mark.parametrize("core_type", ["cube", "vector", "mix"])
-def test_cross_core_sync_rejects_invalid_core_type(core_type):
-    """Mixed kernels target explicit events with the public AIC/AIV names."""
-    with pytest.raises(ValueError, match="core_type"):
+@pytest.mark.parametrize("core_type", ["aic", "aiv", "aic_only", "mix", 0])
+def test_cross_core_sync_rejects_non_enum_core_type(core_type):
+    """``core_type`` is enum-only: the lowered attr spelling is not an input."""
+    with pytest.raises(TypeError, match="core_type must be a KernelType member"):
         system_ops.sync_set(0, pipe=ir.PipeType.FIX, core_type=core_type)
+
+
+def test_cross_core_sync_rejects_mix_kernel():
+    """An event pins one kernel; landing in both is spelled by omitting core_type."""
+    with pytest.raises(ValueError, match="Omit core_type"):
+        system_ops.sync_set(0, pipe=ir.PipeType.FIX, core_type=system_ops.KernelType.MIX)
 
 
 @pytest.mark.parametrize("event_id", [-1, 14])
