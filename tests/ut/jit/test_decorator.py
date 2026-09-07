@@ -3015,7 +3015,7 @@ class TestClosureConstantFolding:
         """A rebound cell must not silently reuse the previous artifact.
 
         A ``nonlocal`` rebind leaves the function text byte-identical, so the
-        dependency hash and closure component must capture the changed value.
+        source dependency hash must capture the changed value.
         Two distinct factory instances would not catch this —
         they are different ``JITFunction`` objects with their own caches.
         """
@@ -3026,18 +3026,12 @@ class TestClosureConstantFolding:
         out = torch.zeros(64, 64, dtype=torch.float32)
 
         del a, out
-        before = entry._folded_closure_constants()
         source_hash_before = entry._get_source_hash()
         static_hash_before = entry._get_static_source_hash()
         set_rows(96)
-        after = entry._folded_closure_constants()
 
         assert entry._get_static_source_hash() == static_hash_before
         assert entry._get_source_hash() != source_hash_before
-        # The legacy closure component also sees the captured value.
-        assert before != after
-        assert ("entry", "rows", "64") in before
-        assert ("entry", "rows", "96") in after
 
     def test_rebound_closure_cell_recompiles_instead_of_reusing(self):
         """The observable consequence: ``compile()`` must not hand back the
@@ -3062,26 +3056,20 @@ class TestClosureConstantFolding:
         assert entry.compile(a, out, config=RunConfig(platform="a2a3sim")) is compiled_after
         assert len(entry._cache) == 2
 
-    def test_closure_constants_key_component_is_stable_and_typed(self):
-        """Equal state yields an equal component (so a genuine re-call still
-        hits the cache), and ``repr`` keeps look-alike values apart."""
-        from pypto.jit.cache import make_cache_key  # noqa: PLC0415
+    def test_closure_source_hash_is_stable_and_typed(self):
+        """The source hash distinguishes folded closure types and stays stable."""
 
-        def key_for(closure_constants):
-            return make_cache_key(
-                source_hash="h",
-                param_names=["x"],
-                tensor_shapes={"x": (64, 64)},
-                tensor_dtypes={"x": DataType.FP32},
-                dynamic_dims=set(),
-                scalar_values={},
-                closure_constants=closure_constants,
-            )
+        def make_entry(value: int | float | bool):
+            @jit
+            def entry(x):
+                return pl.add(x, value)
 
-        base = key_for((("entry", "rows", "1"),))
-        assert base == key_for((("entry", "rows", "1"),))
-        # 1 / 1.0 / True all fold, and all produce different literals.
-        assert len({base, key_for((("entry", "rows", "1.0"),)), key_for((("entry", "rows", "True"),))}) == 3
+            return entry
+
+        entry = make_entry(1)
+        base = entry._get_source_hash()
+        assert base == entry._get_source_hash()
+        assert len({base, *(make_entry(value)._get_source_hash() for value in (1.0, True))}) == 3
 
     def test_module_globals_still_fold(self):
         """Closure bindings are merged on top of globals, not instead of them."""

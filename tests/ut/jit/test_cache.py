@@ -9,6 +9,7 @@
 
 """Tests for python/pypto/jit/cache.py."""
 
+import ast
 import importlib
 import inspect
 import types
@@ -18,6 +19,7 @@ from threading import Event, current_thread
 import pypto.language as pl
 import pytest
 from pypto.ir import DistributedConfig, OptimizationStrategy
+from pypto.jit._source import capture_namespaces, function_namespace
 from pypto.jit.cache import (
     compute_source_hash,
     make_cache_key,
@@ -118,7 +120,6 @@ class TestMakeCacheKey:
             ("memory_planner", None),
             ("enable_pypto_l0c_double_buffer", False),
             ("dep_layouts", ()),
-            ("closure_constants", ()),
             ("runtime", "tensormap_and_ringbuffer"),
         )
 
@@ -505,6 +506,7 @@ class TestResolveEnablePyptoL0cDoubleBuffer:
 
 _CACHE_BLOCK = 32
 _CACHE_UNUSED = 0
+_CACHE_LAYOUT = pl.NZ
 
 
 def _global_slice(x: pl.Tensor[[128, 128], pl.FP32]) -> pl.Tensor[[_CACHE_BLOCK, 128], pl.FP32]:
@@ -579,7 +581,7 @@ class TestGlobalDependencies:
         assert ", 32.0)" in first.as_python()
         assert ", 64.0)" in second.as_python()
 
-    def test_closure_key_components_share_snapshot(self, compile_programs, monkeypatch):
+    def test_source_hash_and_specialization_share_closure_snapshot(self, compile_programs, monkeypatch):
         block = 32
 
         @pl.jit
@@ -817,6 +819,94 @@ class TestGlobalDependencies:
             kernel.compile()
         monkeypatch.setattr(kernel, "_compile", compile_kernel)
         assert "[64, 128]" in kernel.compile().as_python()
+
+    def test_warm_key_reuses_source_and_layout_resolution(self, monkeypatch):
+        helper = pl.jit.inline(_global_slice)
+
+        @pl.jit
+        def entry(x: pl.Tensor[[128, 128], pl.FP32]):
+            return helper(x)
+
+        with capture_namespaces():
+            initial_hash = entry._get_source_hash()
+            initial_layouts = entry._dep_declared_layouts()
+
+        def unexpected_recomputation(*args, **kwargs):
+            pytest.fail("Warm key rebuilt unchanged source structure or parameter layouts")
+
+        monkeypatch.setattr(entry, "_compute_static_source_hash", unexpected_recomputation)
+        monkeypatch.setattr(
+            importlib.import_module("pypto.jit.decorator"), "_param_layouts", unexpected_recomputation
+        )
+        with capture_namespaces():
+            assert entry._get_source_hash() == initial_hash
+            assert entry._dep_declared_layouts() == initial_layouts
+
+    def test_layout_cache_tracks_postponed_annotation_binding(self):
+        def implementation(x: "pl.Tensor[[128, 128], pl.FP32, _CACHE_LAYOUT]"):
+            return x
+
+        func = _with_globals(implementation, _CACHE_LAYOUT=pl.NZ)
+        helper = pl.jit.inline(func)
+
+        @pl.jit
+        def entry(x: pl.Tensor[[128, 128], pl.FP32]):
+            return helper(x)
+
+        first = entry._dep_declared_layouts()
+        assert first == (("implementation", "x", str(pl.NZ)),)
+        with capture_namespaces():
+            assert entry._dep_declared_layouts() == first
+            func.__globals__["_CACHE_LAYOUT"] = pl.DN
+            assert entry._dep_declared_layouts() == first
+        assert entry._dep_declared_layouts() == (("implementation", "x", str(pl.DN)),)
+
+    def test_empty_closure_cell_shadows_module_global(self, monkeypatch):
+        rows = 32
+
+        def implementation(x):
+            return pl.add(x, rows)
+
+        assert implementation.__closure__ is not None
+        del implementation.__closure__[0].cell_contents
+        monkeypatch.setitem(implementation.__globals__, "rows", 5)
+        kernel = pl.jit(implementation)
+        initial_hash = kernel._get_source_hash()
+        monkeypatch.setitem(implementation.__globals__, "rows", 9)
+        assert kernel._get_source_hash() == initial_hash
+        assert function_namespace(implementation).get("rows") != 9
+
+    def test_namespace_view_keeps_closure_precedence_and_module_snapshot(self, monkeypatch):
+        rows = 32
+
+        def implementation(x):
+            return pl.add(x, rows + _CACHE_BLOCK)
+
+        monkeypatch.setitem(implementation.__globals__, "rows", 5)
+        with capture_namespaces():
+            namespace = function_namespace(implementation)
+            rows = 64
+            monkeypatch.setitem(implementation.__globals__, "_CACHE_BLOCK", 96)
+            assert namespace["rows"] == 32
+            assert namespace["_CACHE_BLOCK"] == 32
+            assert dict(namespace)["rows"] == 32
+        assert function_namespace(implementation)["rows"] == 64
+        assert function_namespace(implementation)["_CACHE_BLOCK"] == 96
+
+    def test_invalid_string_annotation_does_not_break_source_hash(self, monkeypatch):
+        def implementation(x):
+            return pl.add(x, _CACHE_BLOCK)
+
+        # Construct invalid annotation syntax as data so type checkers can
+        # still validate the test module itself.
+        definition = ast.parse(
+            "def implementation(x: 'not a valid expression'):\n    return pl.add(x, _CACHE_BLOCK)\n"
+        ).body[0]
+        monkeypatch.setattr(
+            importlib.import_module("pypto.jit.decorator"), "_get_func_def", lambda _: definition
+        )
+        kernel = pl.jit(implementation)
+        assert kernel._get_source_hash() == kernel._get_source_hash()
 
 
 if __name__ == "__main__":

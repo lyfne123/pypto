@@ -65,7 +65,8 @@ import os
 import re
 import struct
 import textwrap
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 from pypto._external_source import external_source_digest
@@ -292,7 +293,7 @@ def _extract_tensor_meta(
     return _build_tensor_meta(extents, dtype, dyn_dims, layout)
 
 
-def _resolve_annotation(annotation: Any, ann_ns: dict[str, Any] | None) -> Any:
+def _resolve_annotation(annotation: Any, ann_ns: Mapping[str, Any] | None) -> Any:
     """Resolve one parameter annotation, evaluating the string form if needed.
 
     ``from __future__ import annotations`` in the *user's* module leaves every
@@ -312,12 +313,12 @@ def _resolve_annotation(annotation: Any, ann_ns: dict[str, Any] | None) -> Any:
     try:
         # Trusted input: the kernel's own annotation source, evaluated in its
         # own globals+closure namespace (same as Python would).
-        return eval(annotation, ann_ns)  # noqa: S307
+        return eval(annotation, dict(ann_ns))  # noqa: S307
     except Exception:  # noqa: BLE001 - leave as string; callers treat it as "cannot infer"
         return annotation
 
 
-def _annotation_namespace(func: Any, sig: inspect.Signature) -> dict[str, Any] | None:
+def _annotation_namespace(func: Any, sig: inspect.Signature) -> Mapping[str, Any] | None:
     """Namespace for resolving ``func``'s string annotations, or None if unneeded."""
     if any(isinstance(p.annotation, str) for n, p in sig.parameters.items() if n != "self"):
         return func_name_lookup(func)
@@ -733,7 +734,10 @@ def _constant_dependency_names(func: Any) -> tuple[str, ...]:
         if annotation is None:
             continue
         if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
-            annotation = ast.parse(annotation.value, mode="eval")
+            try:
+                annotation = ast.parse(annotation.value, mode="eval")
+            except SyntaxError:
+                continue
         names.update(node.id for node in ast.walk(annotation) if isinstance(node, ast.Name))
     return tuple(sorted(names))
 
@@ -1628,11 +1632,37 @@ class _DepGraph(NamedTuple):
     call_args: dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None]
 
 
-class _CachedDepGraph(NamedTuple):
-    """Keep a reusable graph together with the bindings that validate it."""
+class _CachedLayouts(NamedTuple):
+    """Resolved layouts and the annotation bindings used to derive them."""
+
+    bindings: tuple[Any, ...]
+    layouts: tuple[tuple[str, str, str], ...]
+
+
+@dataclass
+class _CachedDepGraph:
+    """Read-only graph data with an atomically replaced layout cache."""
 
     graph: _DepGraph
     bindings: tuple[tuple[_DepBinding, ...], ...]
+    source_hash: str | None
+    layout_dependencies: tuple[tuple[Any, tuple[str, ...]], ...]
+    layouts: _CachedLayouts | None = None
+
+
+@functools.lru_cache(maxsize=512)
+def _layout_dependency_names(func: Any) -> tuple[str, ...]:
+    """Capture roots read by postponed parameter annotations once per function."""
+    names: set[str] = set()
+    for name, param in inspect.signature(func).parameters.items():
+        if name == "self" or not isinstance(param.annotation, str):
+            continue
+        try:
+            annotation = ast.parse(param.annotation, mode="eval")
+        except SyntaxError:
+            continue
+        names.update(node.id for node in ast.walk(annotation) if isinstance(node, ast.Name))
+    return tuple(sorted(names))
 
 
 @functools.lru_cache(maxsize=512)
@@ -1732,54 +1762,30 @@ class JITFunction:
         them in the key, rebinding ``L`` would hand the second call the first
         one's artifact.
 
-        Memoized within the current request so the layouts follow its pinned
-        graph and namespace snapshot, including rebound annotation globals.
+        Reused across calls while the graph and roots referenced by postponed
+        annotations are unchanged. Retain the bindings themselves and compare
+        identity, avoiding overloaded equality and recycled object IDs.
 
         Returns:
-            Sorted ``(dep name, parameter, layout)`` triples — a stable,
-            hashable component for the cache key
+            Sorted ``(dep name, parameter, layout)`` triples for the cache key.
         """
-        deps, _, _, _ = self._get_dep_graph()
-        return tuple(
+        state = self._get_dep_graph_state()
+        bindings = tuple(
+            func_name_lookup(func).get(name) for func, names in state.layout_dependencies for name in names
+        )
+        cached = state.layouts
+        if cached is not None and all(a is b for a, b in zip(bindings, cached.bindings, strict=True)):
+            return cached.layouts
+        layouts = tuple(
             sorted(
                 (dep.__name__, param, str(layout))
-                for dep in deps
+                for dep in state.graph.deps
                 for param, layout in _param_layouts(dep._func, dep.__name__).items()
             )
         )
+        state.layouts = _CachedLayouts(bindings, layouts)
+        return layouts
 
-    def _folded_closure_constants(self) -> tuple[tuple[str, str, str], ...]:
-        """Closure constants that fold into the generated source, for the cache key.
-
-        The body transformer inlines a free ``int`` / ``float`` / ``bool`` as a
-        literal, so its value is baked into the artifact — but it lives in
-        ``__closure__``, not in the function text. Rebinding the cell
-        (``nonlocal rows``) must invalidate the artifact. This legacy key
-        component is retained alongside the source dependency hash, and reads
-        the same per-call snapshot as specialization.
-
-        Every foldable free variable is reported, not only those the body
-        actually references. That is a superset, so it can split the cache more
-        finely than strictly required — the safe direction — and it avoids
-        re-deriving which names survive folding.
-
-        Returns:
-            Sorted ``(function name, free variable, repr of value)`` triples
-        """
-        collected: list[tuple[str, str, str]] = []
-        for func_obj in (self._func, *(dep._func for dep in self._get_deps())):
-            func_name = getattr(func_obj, "__name__", "<unknown>")
-            co_freevars = getattr(getattr(func_obj, "__code__", None), "co_freevars", ())
-            namespace = func_name_lookup(func_obj)
-            for fv_name in co_freevars:
-                value = namespace.get(fv_name)
-                # Mirror the folder's own test so the key covers exactly what
-                # gets inlined (see _BodyTransformer.visit_Name).
-                if isinstance(value, (int, float, bool)) and not isinstance(value, type):
-                    collected.append((func_name, fv_name, repr(value)))
-        return tuple(sorted(collected))
-
-    @cache_in_snapshot
     def _get_dep_graph(self) -> _DepGraph:
         """Return the transitive JIT dep graph rooted at this function.
 
@@ -1813,13 +1819,18 @@ class JITFunction:
           ``None`` if the call site isn't found. Cached so metadata
           resolution doesn't re-walk caller ASTs on every JIT call.
         """
+        return self._get_dep_graph_state().graph
+
+    @cache_in_snapshot
+    def _get_dep_graph_state(self) -> _CachedDepGraph:
+        """Pin a graph and its derived caches to the current request."""
         cached = self._dep_graph_state
         if cached is not None:
             bindings = tuple(
                 tuple(_discover_dep_bindings(fn._func, fn._func_type)) for fn in [self, *cached.graph.deps]
             )
             if bindings == cached.bindings:
-                return cached.graph
+                return cached
         deps_topo: list[JITFunction] = []
         seen: set[int] = set()
         callers_by_dep_id: dict[int, list[Any]] = {}
@@ -1861,8 +1872,17 @@ class JITFunction:
             call_args_cache,
         )
         bindings = tuple(tuple(_discover_dep_bindings(fn._func, fn._func_type)) for fn in [self, *deps_topo])
-        self._dep_graph_state = _CachedDepGraph(graph, bindings)
-        return graph
+        source_hash = (
+            None
+            if any(fn._func_type == "extern" for fn in [self, *deps_topo])
+            else self._compute_static_source_hash(deps_topo)
+        )
+        layout_dependencies = tuple(
+            (dep._func, names) for dep in deps_topo if (names := _layout_dependency_names(dep._func))
+        )
+        state = _CachedDepGraph(graph, bindings, source_hash, layout_dependencies)
+        self._dep_graph_state = state
+        return state
 
     def _get_deps(self) -> list[JITFunction]:
         """Return all transitively-reachable JIT deps in leaf-first order."""
@@ -1901,6 +1921,13 @@ class JITFunction:
     def _get_static_source_hash(self) -> str:
         """Hash source and compilation attributes from the request's graph."""
         deps = self._get_deps()
+        state = self._get_dep_graph_state()
+        if state.source_hash is not None:
+            return state.source_hash
+        return self._compute_static_source_hash(deps)
+
+    def _compute_static_source_hash(self, deps: list[JITFunction]) -> str:
+        """Compute source structure on graph changes or external-source lookups."""
         sources = []
         for jit_func in [self, *deps]:
             sources.append(
@@ -2054,7 +2081,7 @@ class JITFunction:
         # annotation directly rather than via ``typing.get_type_hints`` because the
         # latter runs ``_type_check`` on the result, which rejects our custom
         # ``Tensor`` / ``Scalar`` instance annotations on Python 3.10.
-        ann_ns: dict[str, Any] | None = None
+        ann_ns: Mapping[str, Any] | None = None
         if any(isinstance(p.annotation, str) for n, p in sig.parameters.items() if n != "self"):
             ann_ns = func_name_lookup(self._func)
 
@@ -2075,7 +2102,7 @@ class JITFunction:
                 try:
                     # Trusted input: the kernel's own annotation source, evaluated
                     # in its own globals+closure namespace (same as Python would).
-                    annotation = eval(annotation, ann_ns)  # noqa: S307
+                    annotation = eval(annotation, dict(ann_ns))  # noqa: S307
                 except Exception:  # noqa: BLE001 - leave as string; handled below as "cannot infer"
                     pass
 
@@ -2250,7 +2277,6 @@ class JITFunction:
             tensor_dtypes={n: m.dtype for n, m in specialization.tensor_meta.items()},
             tensor_layouts={n: m.layout for n, m in specialization.tensor_meta.items()},
             dep_layouts=self._dep_declared_layouts(),
-            closure_constants=self._folded_closure_constants(),
             dynamic_dims={
                 (n, i) for n, m in specialization.tensor_meta.items() for i in m.dynamic_dim_indices()
             },

@@ -40,6 +40,7 @@ import functools
 import inspect
 import textwrap
 import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -168,7 +169,7 @@ class SpecializeContext:
     scalar_values: dict[str, int | float | bool]
     scalar_dtypes: dict[str, DataType]
     dep_names: list[str] = field(default_factory=list)
-    py_globals: dict[str, Any] = field(default_factory=dict)
+    py_globals: Mapping[str, Any] = field(default_factory=dict)
     orig_file: str | None = None
     orig_start_line: int = 1
     orig_col_offset: int = 0
@@ -225,7 +226,7 @@ class SpecializeContext:
 # ---------------------------------------------------------------------------
 
 
-def func_name_lookup(func: Any) -> dict[str, Any]:
+def func_name_lookup(func: Any) -> Mapping[str, Any]:
     """Return ``func.__globals__`` merged with closure free-var bindings.
 
     A function defined inside a factory, a test method, or any other enclosing
@@ -548,7 +549,7 @@ class _BodyTransformer(ast.NodeTransformer):
         dep_names: set[str],
         param_names: list[str] | None = None,
         initial_used_names: set[str] | None = None,
-        py_globals: dict[str, Any] | None = None,
+        py_globals: Mapping[str, Any] | None = None,
         dep_param_names: dict[str, list[str]] | None = None,
         dep_func_names: dict[str, str] | None = None,
     ) -> None:
@@ -1198,7 +1199,7 @@ class _BodyTransformer(ast.NodeTransformer):
 # ---------------------------------------------------------------------------
 
 
-def _fold_const_names(node: ast.expr, py_globals: dict[str, Any]) -> ast.expr:
+def _fold_const_names(node: ast.expr, py_globals: Mapping[str, Any]) -> ast.expr:
     """Replace ``Name`` nodes bound to module int/float/bool constants with literals.
 
     An explicit tuple / scalar return annotation is copied into the generated
@@ -1228,7 +1229,7 @@ def _infer_return_type(
     tensor_meta: dict[str, TensorMeta],
     out_params: list[str],
     distributed_params: set[str] | None = None,
-    py_globals: dict[str, Any] | None = None,
+    py_globals: Mapping[str, Any] | None = None,
 ) -> str | None:
     """Infer the return type annotation string from the return statement.
 

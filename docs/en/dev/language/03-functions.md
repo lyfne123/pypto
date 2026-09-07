@@ -34,6 +34,13 @@ and specialization. The hash also includes each helper's function type, level, a
 `auto_scope` setting, so rebinding an identically sourced function with different
 compilation attributes cannot reuse the old artifact.
 
+Each module's globals are copied once per request; helpers use closure overlays
+on that shared snapshot. An empty closure cell still shadows a same-named global.
+Validated graphs retain their Python source hashes, and declared layouts are
+reused while their annotation bindings stay unchanged. External source files are
+still checked on each request. Referenced closure constants are covered by the
+source dependency hash without a separate closure-key component.
+
 The snapshot copies bindings only: mutating arbitrary configuration objects
 or editing compiler/source files during compilation is not supported by this
 constant-tracking mechanism. This behavior does not enable persistent artifact

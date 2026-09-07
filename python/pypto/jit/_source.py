@@ -9,7 +9,8 @@
 
 """Per-call namespace snapshots shared by JIT key construction and specialization."""
 
-from collections.abc import Callable, Iterator
+from collections import ChainMap
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -18,12 +19,13 @@ from typing import Any, TypeVar, cast
 
 T = TypeVar("T")
 R = TypeVar("R")
+_UNBOUND = object()
 
 
 @dataclass
 class _Namespaces:
     modules: dict[int, dict[str, Any]] = field(default_factory=dict)
-    functions: dict[Any, dict[str, Any]] = field(default_factory=dict)
+    functions: dict[Any, Mapping[str, Any]] = field(default_factory=dict)
     values: dict[tuple[Any, Any], Any] = field(default_factory=dict)
 
 
@@ -65,29 +67,33 @@ def cache_in_snapshot(func: Callable[[T], R]) -> Callable[[T], R]:
     return wrapped
 
 
-def function_namespace(func: Any) -> dict[str, Any]:
+def function_namespace(func: Any) -> Mapping[str, Any]:
     """Return captured module globals with closure bindings taking precedence."""
     snapshot = _ACTIVE_NAMESPACES.get()
     if snapshot is not None and func in snapshot.functions:
         return snapshot.functions[func]
 
     module_globals = getattr(func, "__globals__", {})
+    namespace: Mapping[str, Any]
     if snapshot is None:
         namespace = dict(module_globals)
     else:
         module_id = id(module_globals)
         if module_id not in snapshot.modules:
             snapshot.modules[module_id] = dict(module_globals)
-        namespace = dict(snapshot.modules[module_id])
+        namespace = snapshot.modules[module_id]
 
     freevars = getattr(getattr(func, "__code__", None), "co_freevars", ())
     closure = getattr(func, "__closure__", None) or ()
+    bindings: dict[str, Any] = {}
     for name, cell in zip(freevars, closure, strict=True):
         try:
-            namespace[name] = cell.cell_contents
+            bindings[name] = cell.cell_contents
         except ValueError:
-            # An unbound cell does not introduce a usable captured binding.
-            pass
+            # An empty lexical cell still shadows the module global.
+            bindings[name] = _UNBOUND
+    if bindings:
+        namespace = ChainMap(bindings, namespace)
     if snapshot is not None:
         snapshot.functions[func] = namespace
     return namespace
