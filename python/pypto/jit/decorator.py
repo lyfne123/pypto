@@ -74,7 +74,7 @@ from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir
 from pypto.pypto_core import passes as _passes
 
-from ._source import capture_namespaces
+from ._source import cache_in_snapshot, capture_namespaces
 from .cache import CacheKey, compute_source_hash, make_cache_key
 from .specializer import (
     DynDim,
@@ -1619,6 +1619,28 @@ def _resolve_runtime() -> _passes.RuntimeKind:
 # ---------------------------------------------------------------------------
 
 
+class _DepGraph(NamedTuple):
+    """Dependency graph published as one state and treated as read-only."""
+
+    deps: list[JITFunction]
+    callers: dict[int, list[tuple[Any, str]]]
+    callees: dict[int, list[str]]
+    call_args: dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None]
+
+
+class _CachedDepGraph(NamedTuple):
+    """Keep a reusable graph together with the bindings that validate it."""
+
+    graph: _DepGraph
+    bindings: tuple[tuple[_DepBinding, ...], ...]
+
+
+@functools.lru_cache(maxsize=512)
+def _python_source(func: Any) -> str:
+    """Cache immutable Python source without caching mutable dependency state."""
+    return inspect.getsource(func)
+
+
 class JITFunction:
     """A JIT-compiled function with shape specialization and caching.
 
@@ -1646,13 +1668,9 @@ class JITFunction:
             pass splices the body, hand-placed scopes land in the caller.
             ``incore`` / ``opaque`` kinds reject it (they outline into
             separate kernels, so scopes never land in the caller).
-        _dep_graph: Lazily-computed transitive JIT dep graph rooted here —
-            ``(deps_topo, callers_by_dep_id, callees_by_func_id,
-            call_args_cache)``.  ``None`` until first ``_get_dep_graph()``
-            call.  See that method for the tuple's structure.
+        _dep_graph_state: Last resolved graph and its validating bindings,
+            published together. Each call pins its own validated graph.
         _cache: L1 in-memory cache: CacheKey → CompiledProgram (post-pass ir.Program wrapped).
-        _source_hash: Cached source structure hash, excluding per-call constant values.
-        _dep_bindings: Direct dependency bindings used to validate the cached graph.
     """
 
     def __init__(
@@ -1678,19 +1696,8 @@ class JITFunction:
         self._external_aiv_source = external_aiv_source
         self._external_dual_aiv_dispatch = external_dual_aiv_dispatch
         self._external_include_dirs = external_include_dirs
-        self._dep_graph: (
-            tuple[
-                list[JITFunction],
-                dict[int, list[Any]],
-                dict[int, list[str]],
-                dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None],
-            ]
-            | None
-        ) = None
+        self._dep_graph_state: _CachedDepGraph | None = None
         self._cache: dict[CacheKey, Any] = {}  # CacheKey → CompiledProgram
-        self._source_hash: str | None = None
-        self._dep_bindings: tuple[tuple[JITFunction, ...], ...] = ()
-        self._dep_layouts: tuple[tuple[str, str, str], ...] | None = None
 
         # Preserve function metadata
         self.__name__ = func.__name__
@@ -1713,6 +1720,7 @@ class JITFunction:
     # Lazy dep discovery
     # ------------------------------------------------------------------
 
+    @cache_in_snapshot
     def _dep_declared_layouts(self) -> tuple[tuple[str, str, str], ...]:
         """Layouts every reachable dep declares on its own parameters.
 
@@ -1724,26 +1732,21 @@ class JITFunction:
         them in the key, rebinding ``L`` would hand the second call the first
         one's artifact.
 
-        Computed once and memoized: the key is rebuilt on every call including
-        cache hits, and re-deriving it runs ``inspect.signature`` (plus ``eval``
-        for postponed annotations) per dep. A dep's declarations cannot change
-        over this ``JITFunction``'s lifetime, so the cost is paid once — same
-        reasoning as ``_get_dep_graph`` / ``_get_source_hash``.
+        Memoized within the current request so the layouts follow its pinned
+        graph and namespace snapshot, including rebound annotation globals.
 
         Returns:
             Sorted ``(dep name, parameter, layout)`` triples — a stable,
             hashable component for the cache key
         """
-        if self._dep_layouts is None:
-            deps, _, _, _ = self._get_dep_graph()
-            self._dep_layouts = tuple(
-                sorted(
-                    (dep.__name__, param, str(layout))
-                    for dep in deps
-                    for param, layout in _param_layouts(dep._func, dep.__name__).items()
-                )
+        deps, _, _, _ = self._get_dep_graph()
+        return tuple(
+            sorted(
+                (dep.__name__, param, str(layout))
+                for dep in deps
+                for param, layout in _param_layouts(dep._func, dep.__name__).items()
             )
-        return self._dep_layouts
+        )
 
     def _folded_closure_constants(self) -> tuple[tuple[str, str, str], ...]:
         """Closure constants that fold into the generated source, for the cache key.
@@ -1776,19 +1779,14 @@ class JITFunction:
                     collected.append((func_name, fv_name, repr(value)))
         return tuple(sorted(collected))
 
-    def _get_dep_graph(
-        self,
-    ) -> tuple[
-        list[JITFunction],
-        dict[int, list[tuple[Any, str]]],
-        dict[int, list[str]],
-        dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None],
-    ]:
+    @cache_in_snapshot
+    def _get_dep_graph(self) -> _DepGraph:
         """Return the transitive JIT dep graph rooted at this function.
 
         The graph is computed lazily and reused while its direct dependency
-        bindings remain unchanged. Rebinding a helper invalidates the graph
-        and source structure hash. Returns:
+        bindings remain unchanged. Each request pins its validated graph;
+        another request can publish a new graph without changing this one.
+        Published graphs are never modified. Returns:
 
         - ``deps_topo``: every reachable dep in leaf-first topological order
           (deduplicated by underlying Python function identity). The entry
@@ -1815,67 +1813,63 @@ class JITFunction:
           ``None`` if the call site isn't found. Cached so metadata
           resolution doesn't re-walk caller ASTs on every JIT call.
         """
-        if self._dep_graph is not None:
-            functions = [self, *self._dep_graph[0]]
-            bindings = tuple(tuple(_discover_deps(fn._func, fn._func_type)) for fn in functions)
-            if bindings != self._dep_bindings:
-                self._dep_graph = None
-                self._source_hash = None
-                self._dep_layouts = None
-        if self._dep_graph is None:
-            deps_topo: list[JITFunction] = []
-            seen: set[int] = set()
-            callers_by_dep_id: dict[int, list[Any]] = {}
-            callees_by_func_id: dict[int, list[str]] = {}
-            call_args_cache: dict[
-                tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None
-            ] = {}
-
-            def visit(func: Any, caller_func_type: str) -> None:
-                direct = _discover_dep_bindings(func, caller_func_type)
-                # Call names, not ``__name__``: these become ``ctx.dep_names``,
-                # which the body transformer matches against the ``ast.Name``
-                # the source actually calls.
-                callees_by_func_id[id(func)] = [b.call_name for b in direct]
-                for call_name, dep in direct:
-                    # Key everything off ``id(dep._func)`` (the underlying
-                    # Python function) — same key the downstream helpers
-                    # use, and stable across multiple wrapper objects for
-                    # the same source function.
-                    callers = callers_by_dep_id.setdefault(id(dep._func), [])
-                    if (func, call_name) not in callers:
-                        callers.append((func, call_name))
-                    # Memoise per-(caller, call name) call-site args once.
-                    cache_key = (id(func), call_name)
-                    if cache_key not in call_args_cache:
-                        call_args_cache[cache_key] = _extract_call_args_for_dep(func, call_name)
-                    if id(dep._func) in seen:
-                        continue
-                    # Mark before recursing — this also serves as a cycle
-                    # guard (a self-recursive JIT function is unsupported
-                    # but won't loop forever here).
-                    seen.add(id(dep._func))
-                    visit(dep._func, dep._func_type)
-                    deps_topo.append(dep)
-
-            visit(self._func, self._func_type)
-            self._dep_graph = (
-                deps_topo,
-                callers_by_dep_id,
-                callees_by_func_id,
-                call_args_cache,
+        cached = self._dep_graph_state
+        if cached is not None:
+            bindings = tuple(
+                tuple(_discover_dep_bindings(fn._func, fn._func_type)) for fn in [self, *cached.graph.deps]
             )
-            self._dep_bindings = tuple(
-                tuple(_discover_deps(fn._func, fn._func_type)) for fn in [self, *deps_topo]
-            )
-        return self._dep_graph
+            if bindings == cached.bindings:
+                return cached.graph
+        deps_topo: list[JITFunction] = []
+        seen: set[int] = set()
+        callers_by_dep_id: dict[int, list[Any]] = {}
+        callees_by_func_id: dict[int, list[str]] = {}
+        call_args_cache: dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None] = {}
+
+        def visit(func: Any, caller_func_type: str) -> None:
+            direct = _discover_dep_bindings(func, caller_func_type)
+            # Call names, not ``__name__``: these become ``ctx.dep_names``,
+            # which the body transformer matches against the ``ast.Name``
+            # the source actually calls.
+            callees_by_func_id[id(func)] = [b.call_name for b in direct]
+            for call_name, dep in direct:
+                # Key everything off ``id(dep._func)`` (the underlying
+                # Python function) — same key the downstream helpers
+                # use, and stable across multiple wrapper objects for
+                # the same source function.
+                callers = callers_by_dep_id.setdefault(id(dep._func), [])
+                if (func, call_name) not in callers:
+                    callers.append((func, call_name))
+                # Memoise per-(caller, call name) call-site args once.
+                cache_key = (id(func), call_name)
+                if cache_key not in call_args_cache:
+                    call_args_cache[cache_key] = _extract_call_args_for_dep(func, call_name)
+                if id(dep._func) in seen:
+                    continue
+                # Mark before recursing — this also serves as a cycle
+                # guard (a self-recursive JIT function is unsupported
+                # but won't loop forever here).
+                seen.add(id(dep._func))
+                visit(dep._func, dep._func_type)
+                deps_topo.append(dep)
+
+        visit(self._func, self._func_type)
+        graph = _DepGraph(
+            deps_topo,
+            callers_by_dep_id,
+            callees_by_func_id,
+            call_args_cache,
+        )
+        bindings = tuple(tuple(_discover_dep_bindings(fn._func, fn._func_type)) for fn in [self, *deps_topo])
+        self._dep_graph_state = _CachedDepGraph(graph, bindings)
+        return graph
 
     def _get_deps(self) -> list[JITFunction]:
         """Return all transitively-reachable JIT deps in leaf-first order."""
         return self._get_dep_graph()[0]
 
     # ------------------------------------------------------------------
-    # Source hash (includes all dep sources; lazily computed after deps found)
+    # Source hash (derived from the request's pinned dependency graph)
     # ------------------------------------------------------------------
 
     def _external_source_paths(self) -> list[str]:
@@ -1903,40 +1897,37 @@ class JITFunction:
                 records.append((index, func.__module__, func.__qualname__, name, kind, encoded))
         return compute_source_hash([source_hash, json.dumps(records, separators=(",", ":"))])
 
+    @cache_in_snapshot
     def _get_static_source_hash(self) -> str:
+        """Hash source and compilation attributes from the request's graph."""
         deps = self._get_deps()
-        # External kernel .cpp files are mutable on disk, unlike the (fixed once
-        # loaded) Python source. When any extern dep is present, recompute the
-        # hash on every lookup so an edited kernel is picked up even within a
-        # long-lived process; otherwise cache it.
-        has_extern = any(d._func_type == "extern" for d in deps)
-        if self._source_hash is not None and not has_extern:
-            return self._source_hash
-        sources = [inspect.getsource(self._func)]
-        for dep in deps:
-            if dep._func_type == "extern":
-                # The implementation and launch ABI both affect the artifact.
-                # Include the quoted-include closure so editing a sibling .cce
-                # invalidates the cache even when the entry .cpp is unchanged.
+        sources = []
+        for jit_func in [self, *deps]:
+            sources.append(
+                json.dumps(
+                    (jit_func.__name__, jit_func._func_type, str(jit_func._level), jit_func._auto_scope),
+                    separators=(",", ":"),
+                )
+            )
+            if jit_func._func_type == "extern":
+                # External sources and quoted includes can change between
+                # requests. Recompute their digest even when the graph is reused.
                 sources.append(
                     external_source_digest(
-                        dep._external_source_paths(),
+                        jit_func._external_source_paths(),
                         metadata=(
-                            inspect.getsource(dep._func),
-                            dep.__name__,
-                            dep._external_core_type or "",
-                            str(dep._external_dual_aiv_dispatch),
-                            *(f"include_dir:{path}" for path in dep._external_include_dirs),
+                            _python_source(jit_func._func),
+                            jit_func.__name__,
+                            jit_func._external_core_type or "",
+                            str(jit_func._external_dual_aiv_dispatch),
+                            *(f"include_dir:{path}" for path in jit_func._external_include_dirs),
                         ),
-                        include_dirs=dep._external_include_dirs,
+                        include_dirs=jit_func._external_include_dirs,
                     )
                 )
             else:
-                sources.append(inspect.getsource(dep._func))
-        source_hash = compute_source_hash(sources)
-        if not has_extern:
-            self._source_hash = source_hash
-        return source_hash
+                sources.append(_python_source(jit_func._func))
+        return compute_source_hash(sources)
 
     # ------------------------------------------------------------------
     # Parameter introspection

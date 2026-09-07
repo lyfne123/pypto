@@ -10,7 +10,10 @@
 """Tests for python/pypto/jit/cache.py."""
 
 import importlib
+import inspect
 import types
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event, current_thread
 
 import pypto.language as pl
 import pytest
@@ -24,6 +27,7 @@ from pypto.jit.decorator import (
     _resolve_memory_planner,
     _resolve_runtime,
 )
+from pypto.language.parser.diagnostics.exceptions import ParserSyntaxError
 from pypto.pypto_core import DataType, ir, passes
 from pypto.pypto_core.passes import MemoryPlanner
 from pypto.runtime import RunConfig
@@ -695,6 +699,110 @@ class TestGlobalDependencies:
         second = kernel.compile()
         assert "[64, 128]" in second.as_python()
         assert len(compile_programs) == 2
+
+    def test_concurrent_helper_rebinding_keeps_each_call_snapshot(self, compile_programs, monkeypatch):
+        @pl.jit.inline
+        def add_impl(x: pl.Tensor[[128, 128], pl.FP32]) -> pl.Tensor[[128, 128], pl.FP32]:
+            return pl.add(x, x)
+
+        @pl.jit.inline
+        def mul_impl(x: pl.Tensor[[128, 128], pl.FP32]) -> pl.Tensor[[128, 128], pl.FP32]:
+            return pl.mul(x, x)
+
+        helper = add_impl
+
+        @pl.jit
+        def entry(x: pl.Tensor[[128, 128], pl.FP32]) -> pl.Tensor[[128, 128], pl.FP32]:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                y = helper(x)
+            return y
+
+        initial_hash = entry._get_source_hash()
+        expected_first = entry.specialize().as_python()
+        get_deps = entry._get_deps
+        captured, resume = Event(), Event()
+
+        def pause_after_dependency_capture():
+            deps = get_deps()
+            frame = inspect.currentframe()
+            assert frame is not None and frame.f_back is not None
+            if (
+                current_thread().name.startswith("jit-request")
+                and frame.f_back.f_code.co_name == "_get_static_source_hash"
+            ):
+                captured.set()
+                assert resume.wait(10), "Timed out waiting for the second compilation"
+            return deps
+
+        monkeypatch.setattr(entry, "_get_deps", pause_after_dependency_capture)
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="jit-request") as executor:
+            first_call = executor.submit(entry.compile)
+            try:
+                assert captured.wait(10), "First call did not capture its dependency graph"
+                helper = mul_impl
+                second = entry.compile()
+                assert entry._get_source_hash() != initial_hash
+            finally:
+                resume.set()
+            first = first_call.result(timeout=10)
+
+        assert first is not second
+        assert first.as_python() == expected_first
+        assert second.as_python() == entry.specialize().as_python()
+        assert len(compile_programs) == 2
+        assert entry.compile() is second
+        helper = add_impl
+        assert entry.compile() is first
+
+    @pytest.mark.parametrize(
+        "before,after",
+        [
+            (pl.jit.inline, pl.jit.opaque),
+            (pl.jit.inline(auto_scope=True), pl.jit.inline(auto_scope=False)),
+        ],
+        ids=["function-type", "auto-scope"],
+    )
+    def test_rebound_helper_attributes_invalidate_cache(self, compile_programs, before, after):
+        def implementation(x: pl.Tensor[[128, 128], pl.FP32]) -> pl.Tensor[[128, 128], pl.FP32]:
+            return pl.add(x, x)
+
+        helper = before(implementation)
+
+        @pl.jit
+        def entry(x: pl.Tensor[[128, 128], pl.FP32]) -> pl.Tensor[[128, 128], pl.FP32]:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                y = helper(x)
+            return y
+
+        initial_hash = entry._get_source_hash()
+        first = entry.compile()
+        helper = after(implementation)
+        assert entry._get_source_hash() != initial_hash
+        second = entry.compile()
+        assert second is not first
+        assert second.as_python() == entry.specialize().as_python()
+        assert len(compile_programs) == 2
+        assert entry.compile() is second
+
+    def test_rebound_helper_level_does_not_hide_invalid_ir(self, compile_programs):
+        def implementation(x: pl.Tensor[[128, 128], pl.FP32]) -> pl.Tensor[[128, 128], pl.FP32]:
+            return pl.add(x, x)
+
+        helper = pl.jit.incore(level=pl.Level.CHIP_DIE)(implementation)
+
+        @pl.jit
+        def entry(x: pl.Tensor[[128, 128], pl.FP32]) -> pl.Tensor[[128, 128], pl.FP32]:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                y = helper(x)
+            return y
+
+        initial_hash = entry._get_source_hash()
+        entry.compile()
+        helper = pl.jit.incore(level=pl.Level.AIC)(implementation)
+        assert entry._get_source_hash() != initial_hash
+        with pytest.raises(ParserSyntaxError, match="explicit level=AIC"):
+            entry.compile()
+        assert len(compile_programs) == 1
 
     def test_snapshot_is_released_after_compile_failure(self, compile_programs, monkeypatch):
         kernel = pl.jit(_global_slice)

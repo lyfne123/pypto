@@ -9,17 +9,22 @@
 
 """Per-call namespace snapshots shared by JIT key construction and specialization."""
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any
+from functools import wraps
+from typing import Any, TypeVar, cast
+
+T = TypeVar("T")
+R = TypeVar("R")
 
 
 @dataclass
 class _Namespaces:
     modules: dict[int, dict[str, Any]] = field(default_factory=dict)
     functions: dict[Any, dict[str, Any]] = field(default_factory=dict)
+    values: dict[tuple[Any, Any], Any] = field(default_factory=dict)
 
 
 _ACTIVE_NAMESPACES: ContextVar[_Namespaces | None] = ContextVar("jit_source_namespaces", default=None)
@@ -41,6 +46,23 @@ def capture_namespaces() -> Iterator[None]:
         yield
     finally:
         _ACTIVE_NAMESPACES.reset(token)
+
+
+def cache_in_snapshot(func: Callable[[T], R]) -> Callable[[T], R]:
+    """Memoize a unary helper only within the current compilation request."""
+
+    @wraps(func)
+    def wrapped(obj: T) -> R:
+        snapshot = _ACTIVE_NAMESPACES.get()
+        if snapshot is None:
+            with capture_namespaces():
+                return wrapped(obj)
+        key = (func, obj)
+        if key not in snapshot.values:
+            snapshot.values[key] = func(obj)
+        return cast(R, snapshot.values[key])
+
+    return wrapped
 
 
 def function_namespace(func: Any) -> dict[str, Any]:

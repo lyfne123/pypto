@@ -29,7 +29,12 @@ Name resolution, key construction, and specialization share a per-call namespace
 snapshot. Constants rebound after capture affect the next call, not the artifact
 being compiled. Each helper retains its own namespace, even when constants have
 the same name. Rebinding a referenced JIT helper also refreshes the dependency
-graph. The snapshot copies bindings only: mutating arbitrary configuration objects
+graph. Each concurrent call retains its captured graph throughout key construction
+and specialization. The hash also includes each helper's function type, level, and
+`auto_scope` setting, so rebinding an identically sourced function with different
+compilation attributes cannot reuse the old artifact.
+
+The snapshot copies bindings only: mutating arbitrary configuration objects
 or editing compiler/source files during compilation is not supported by this
 constant-tracking mechanism. This behavior does not enable persistent artifact
 caching; compiled objects are still reused within the process.
