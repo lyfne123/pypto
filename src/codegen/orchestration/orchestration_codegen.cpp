@@ -300,6 +300,26 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// it makes every generated identifier ambiguous to read and to grep.
   void SetTaskVarPrefix(std::string prefix) { task_var_prefix_ = std::move(prefix); }
 
+  /// Reserve identifiers the emitted C++ function already declares outside the
+  /// body this instance generates, so no body Var can be handed one of them.
+  ///
+  /// The entry gets this for free: its ``param_name_set`` seeds
+  /// ``declared_var_names_``. A Graph function passes an empty set (its
+  /// parameters must not be ``ext_``-rewritten), so without this its
+  /// ``const Tensor& <p> = args.tensor(i).ref();`` prologue names are invisible
+  /// to ``ReserveVarEmitName``. The first body SSA rename of a parameter then
+  /// takes the parameter's own name — shadowing the prologue decl and, when it
+  /// happens inside a ``pl.manual_scope``, recording that name in
+  /// ``manual_local_names_`` as if it were scope-local. ``IsEnclosingScopeValid``
+  /// then reports the *parameter* as unreachable from outside the block, so
+  /// every later writeback mints a block-scoped ``const Tensor& <p>__ssa_vN =
+  /// <p>;`` alias instead of remapping onto the parameter — and a task placed
+  /// after the block references an identifier that has fallen out of C++ scope
+  /// (issue #2605).
+  void ReserveDeclaredNames(const std::set<std::string>& names) {
+    declared_var_names_.insert(names.begin(), names.end());
+  }
+
   void SetEffectiveUses(std::unordered_set<const Var*> uses) { effective_uses_ = std::move(uses); }
   [[nodiscard]] bool NeedsVectorInclude() const { return needs_vector_include_; }
 
@@ -4498,7 +4518,10 @@ std::string GenerateDynamicDimDefs(const std::vector<VarPtr>& params, const std:
 /// * ``param_name_set`` is empty. `GetExternalTensorName` rewrites any name in
 ///   that set to ``ext_<name>``, which is right for the entry (whose parameters
 ///   arrive through ``orch_args``) and wrong here, where they are ordinary
-///   function parameters bound at the top of the body.
+///   function parameters bound at the top of the body. The parameter names are
+///   still handed to `ReserveDeclaredNames`, which is the other half of what
+///   ``param_name_set`` does for the entry: it keeps a body Var from taking a
+///   name the prologue already declares (issue #2605).
 /// * A task-var prefix, because this instance's counters restart at 0.
 ///
 /// Boundary scalars are bound as ``const uint64_t&``, never by value. The
@@ -4529,14 +4552,21 @@ std::string GenerateGraphFunctions(const ProgramPtr& program, const FunctionPtr&
     // the two disagree the body would reference a symbol the header never
     // declared. Seeding makes them agree by construction.
     std::unordered_map<const Var*, std::string> emit_name_map;
+    std::set<std::string> param_emit_names;
     for (const auto& param : graph_func->params_) {
-      emit_name_map[param.get()] = auto_name::GetCompatibleBaseName(param->name_hint_);
+      std::string name = auto_name::GetCompatibleBaseName(param->name_hint_);
+      emit_name_map[param.get()] = name;
+      param_emit_names.insert(std::move(name));
     }
     OrchestrationStmtCodegen body_codegen(program, func_name_to_id, func_name_to_core_type,
                                           func_name_to_signature, next_func_id, std::move(emit_name_map),
                                           /*param_name_set=*/{}, /*param_name_to_orch_index=*/{},
                                           /*packed_fp4_axis=*/{}, /*dist_param_to_ctx_param=*/{});
     body_codegen.SetTaskVarPrefix("g" + std::to_string(graph_index) + "_");
+    // The prologue below declares one C++ name per parameter. They are not in
+    // ``param_name_set``, so reserve them explicitly or a body SSA rename will
+    // shadow one (issue #2605; see ReserveDeclaredNames).
+    body_codegen.ReserveDeclaredNames(param_emit_names);
     body_codegen.SetCallTupleElements(graph_info.call_tuple_elements);
     body_codegen.SetTupleVarToKey(graph_info.tuple_var_to_key);
     body_codegen.SetEffectiveUses(std::move(use_collector.var_uses));
