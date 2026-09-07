@@ -396,6 +396,19 @@ void aicpu_orchestration_entry(const ChipTaskArgs& orch_args) {
 | 张量参数索引 | `orch_args.tensor(N)` | `orch_args.tensor(0)` |
 | 标量参数索引 | `orch_args.scalar(N)` | `orch_args.scalar(0)` |
 
+### Graph 函数体
+
+`FunctionType.Graph` 的函数体由第二个 `OrchestrationStmtCodegen` 实例生成，它
+的参数是在辅助函数开头绑定的普通 C++ 参数（`const Tensor& c =
+args.tensor(1).ref();`），而非入口参数。因此它的 `param_name_set` 为空——
+`GetExternalTensorName` 不应把它们改写成 `ext_<name>`——但这些名字仍要通过
+`ReserveDeclaredNames` 预留。
+
+两者缺一不可。若不预留，函数体中该参数的第一个 SSA 重命名就会占用参数自身的
+名字；当它是在 `pl.manual_scope` 内被预留时，该名字随后会被当作作用域局部名，
+之后每一次回写都会在块内生成 `const Tensor& c__ssa_vN = c;` 别名，而不是重映射
+到参数上，于是块之后的任务启动引用到的标识符已经脱离了 C++ 作用域。
+
 ## 控制流生成
 
 ### ForStmt

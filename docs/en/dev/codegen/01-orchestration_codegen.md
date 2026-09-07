@@ -409,6 +409,21 @@ names in the output), but never for identity decisions.
 | Tensor arg index | `orch_args.tensor(N)` | `orch_args.tensor(0)` |
 | Scalar arg index | `orch_args.scalar(N)` | `orch_args.scalar(0)` |
 
+### Graph function bodies
+
+A `FunctionType.Graph` body is emitted by a second `OrchestrationStmtCodegen`
+instance whose parameters are ordinary C++ parameters bound at the top of the
+helper (`const Tensor& c = args.tensor(1).ref();`), not entry arguments. So its
+`param_name_set` is empty — `GetExternalTensorName` must not rewrite them to
+`ext_<name>` — but the names are still reserved via `ReserveDeclaredNames`.
+
+Both halves are load-bearing. Without the reservation, the first body SSA rename
+of a parameter takes the parameter's own name; reserved inside a
+`pl.manual_scope`, that name then reads as scope-local, every later writeback
+mints a block-scoped `const Tensor& c__ssa_vN = c;` alias instead of remapping
+onto the parameter, and a launch placed after the block names an identifier that
+has fallen out of C++ scope.
+
 ## Control Flow Generation
 
 ### ForStmt
