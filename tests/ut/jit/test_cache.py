@@ -9,6 +9,10 @@
 
 """Tests for python/pypto/jit/cache.py."""
 
+import importlib
+import types
+
+import pypto.language as pl
 import pytest
 from pypto.ir import DistributedConfig, OptimizationStrategy
 from pypto.jit.cache import (
@@ -493,6 +497,218 @@ class TestResolveEnablePyptoL0cDoubleBuffer:
         assert cfg.memory_planner is None
         with passes.PassContext([], memory_planner=MemoryPlanner.PTOAS):
             assert _resolve_memory_planner(cfg) == MemoryPlanner.PTOAS
+
+
+_CACHE_BLOCK = 32
+_CACHE_UNUSED = 0
+
+
+def _global_slice(x: pl.Tensor[[128, 128], pl.FP32]) -> pl.Tensor[[_CACHE_BLOCK, 128], pl.FP32]:
+    with pl.at(level=pl.Level.CORE_GROUP):
+        y = pl.slice(x, [_CACHE_BLOCK, 128], [0, 0])
+    return y
+
+
+def _with_globals(func, **values):
+    cloned = types.FunctionType(func.__code__, {**func.__globals__, **values}, func.__name__)
+    cloned.__annotations__ = func.__annotations__.copy()
+    return cloned
+
+
+class TestGlobalDependencies:
+    @pytest.fixture
+    def compile_programs(self, monkeypatch):
+        """Exercise real specialization and parsing without invoking toolchains."""
+        programs = []
+
+        def compile_program(program, **kwargs):
+            programs.append(program)
+            return program
+
+        monkeypatch.setattr(importlib.import_module("pypto.ir.compile"), "compile", compile_program)
+        return programs
+
+    def test_global_change_invalidates_memory_cache(self, compile_programs, monkeypatch):
+        kernel = pl.jit(_global_slice)
+        first = kernel.compile()
+        assert kernel.compile() is first
+        monkeypatch.setitem(_global_slice.__globals__, "_CACHE_BLOCK", 64)
+        second = kernel.compile()
+        assert second is not first
+        assert len(compile_programs) == 2
+        assert "[32, 128]" in first.as_python()
+        assert "[64, 128]" in second.as_python()
+
+    def test_hash_available_before_specialization(self):
+        first = pl.jit(_with_globals(_global_slice, _CACHE_BLOCK=32))
+        second = pl.jit(_with_globals(_global_slice, _CACHE_BLOCK=64))
+        assert first._get_source_hash() != second._get_source_hash()
+
+    def test_unused_global_does_not_invalidate(self, monkeypatch):
+        kernel = pl.jit(_global_slice)
+        initial = kernel._get_source_hash()
+        monkeypatch.setitem(_global_slice.__globals__, "_CACHE_UNUSED", 123)
+        assert kernel._get_source_hash() == initial
+
+    @pytest.mark.parametrize("first,second", [(True, 1), (1, 1.0), (0.0, -0.0)])
+    def test_constant_encoding_preserves_type_and_float_bits(self, first, second):
+        def add_constant(x: pl.Tensor[[128], pl.FP32]):
+            return pl.add(x, _CACHE_BLOCK)
+
+        a = pl.jit(_with_globals(add_constant, _CACHE_BLOCK=first))
+        b = pl.jit(_with_globals(add_constant, _CACHE_BLOCK=second))
+        assert a._get_source_hash() != b._get_source_hash()
+
+    def test_closure_constant_uses_current_snapshot(self, compile_programs):
+        block = 32
+
+        @pl.jit
+        def kernel(x: pl.Tensor[[128], pl.FP32]) -> pl.Tensor[[128], pl.FP32]:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                y = pl.add(x, block)
+            return y
+
+        first = kernel.compile()
+        block = 64
+        second = kernel.compile()
+        assert second is not first
+        assert ", 32.0)" in first.as_python()
+        assert ", 64.0)" in second.as_python()
+
+    def test_closure_key_components_share_snapshot(self, compile_programs, monkeypatch):
+        block = 32
+
+        @pl.jit
+        def kernel(x: pl.Tensor[[128], pl.FP32]) -> pl.Tensor[[128], pl.FP32]:
+            with pl.at(level=pl.Level.CORE_GROUP):
+                y = pl.add(x, block)
+            return y
+
+        source_hash = kernel._get_source_hash
+
+        def mutate_after_source_hash():
+            nonlocal block
+            result = source_hash()
+            block = 64
+            return result
+
+        monkeypatch.setattr(kernel, "_get_source_hash", mutate_after_source_hash)
+        first = kernel.compile()
+        assert ", 32.0)" in first.as_python()
+        monkeypatch.setattr(kernel, "_get_source_hash", source_hash)
+        block = 32
+        assert kernel.compile() is first
+        block = 64
+        assert ", 64.0)" in kernel.compile().as_python()
+        assert len(compile_programs) == 2
+
+    def test_same_global_name_in_distinct_namespaces(self):
+        def left(x):
+            return pl.add(x, _CACHE_BLOCK)
+
+        def right(x):
+            return pl.mul(x, _CACHE_BLOCK)
+
+        left_dep = pl.jit.inline(_with_globals(left, _CACHE_BLOCK=32))
+        right_dep = pl.jit.inline(_with_globals(right, _CACHE_BLOCK=64))
+
+        @pl.jit
+        def entry(x: pl.Tensor[[128], pl.FP32]):
+            return right_dep(left_dep(x))
+
+        initial = entry._get_source_hash()
+        left_dep._func.__globals__["_CACHE_BLOCK"] = 16
+        left_changed = entry._get_source_hash()
+        assert left_changed != initial
+        right_dep._func.__globals__["_CACHE_BLOCK"] = 16
+        assert entry._get_source_hash() != left_changed
+
+    def test_local_shadow_does_not_invalidate(self, monkeypatch):
+        @pl.jit
+        def kernel(x: pl.Tensor[[128], pl.FP32]):
+            _CACHE_BLOCK = 16
+            with pl.at(level=pl.Level.CORE_GROUP):
+                y = pl.slice(x, [_CACHE_BLOCK], [0])
+            return y
+
+        initial = kernel._get_source_hash()
+        monkeypatch.setitem(_global_slice.__globals__, "_CACHE_BLOCK", 64)
+        assert kernel._get_source_hash() == initial
+
+    def test_return_annotation_global_is_keyed(self, monkeypatch):
+        @pl.jit
+        def kernel(x: pl.Tensor[[128], pl.FP32]) -> pl.Tensor[[_CACHE_BLOCK], pl.FP32]:
+            return x
+
+        initial = kernel._get_source_hash()
+        monkeypatch.setitem(_global_slice.__globals__, "_CACHE_BLOCK", 64)
+        assert kernel._get_source_hash() != initial
+
+    def test_transitive_global_change(self, monkeypatch):
+        leaf = pl.jit.inline(_global_slice)
+
+        @pl.jit.inline
+        def helper(x):
+            return leaf(x)
+
+        @pl.jit
+        def entry(x: pl.Tensor[[128], pl.FP32]):
+            return helper(x)
+
+        initial = entry._get_source_hash()
+        monkeypatch.setitem(_global_slice.__globals__, "_CACHE_BLOCK", 64)
+        assert entry._get_source_hash() != initial
+
+    def test_rebound_helper_changes_dependency_graph(self):
+        @pl.jit.inline
+        def helper(x):
+            return x
+
+        @pl.jit
+        def entry(x: pl.Tensor[[128], pl.FP32]):
+            return helper(x)
+
+        initial = entry._get_source_hash()
+        assert entry._get_deps() == [helper]
+
+        @pl.jit.inline
+        def helper(x):
+            return pl.add(x, x)
+
+        assert entry._get_source_hash() != initial
+        assert entry._get_deps() == [helper]
+
+    def test_compilation_uses_key_snapshot(self, compile_programs, monkeypatch):
+        kernel = pl.jit(_global_slice)
+        make_key = importlib.import_module("pypto.jit.decorator").make_cache_key
+
+        def mutate_after_key(**kwargs):
+            key = make_key(**kwargs)
+            monkeypatch.setitem(_global_slice.__globals__, "_CACHE_BLOCK", 64)
+            return key
+
+        monkeypatch.setattr(
+            importlib.import_module("pypto.jit.decorator"), "make_cache_key", mutate_after_key
+        )
+        first = kernel.compile()
+        assert "[32, 128]" in first.as_python()
+        second = kernel.compile()
+        assert "[64, 128]" in second.as_python()
+        assert len(compile_programs) == 2
+
+    def test_snapshot_is_released_after_compile_failure(self, compile_programs, monkeypatch):
+        kernel = pl.jit(_global_slice)
+        compile_kernel = kernel._compile
+
+        def fail_once(*args, **kwargs):
+            monkeypatch.setitem(_global_slice.__globals__, "_CACHE_BLOCK", 64)
+            raise RuntimeError("injected compilation failure")
+
+        monkeypatch.setattr(kernel, "_compile", fail_once)
+        with pytest.raises(RuntimeError, match="injected compilation failure"):
+            kernel.compile()
+        monkeypatch.setattr(kernel, "_compile", compile_kernel)
+        assert "[64, 128]" in kernel.compile().as_python()
 
 
 if __name__ == "__main__":

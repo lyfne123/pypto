@@ -45,11 +45,11 @@ Public API
 
 JITFunction.__call__ flow
 -------------------------
-1. Lazily discover deps (incore/inline/opaque) from entry's globals (once).
+1. Capture namespaces and refresh deps when referenced JIT bindings change.
 2. Classify args: tensor vs scalar.
 3. Extract TensorMeta from torch.Tensor arguments.
 4. Scan entry + dep ASTs for bind_dynamic declarations.
-5. Build CacheKey (dynamic dims → None in shape tuple).
+5. Build CacheKey including referenced constants (dynamic dims → None in shape tuple).
 6. Cache hit  → execute cached CompiledProgram on device → return result.
 7. Cache miss → specialize (entry + deps) → pl.parse() → ir.compile() → cache → execute → return.
 """
@@ -60,8 +60,10 @@ import ast
 import copy
 import functools
 import inspect
+import json
 import os
 import re
+import struct
 import textwrap
 from collections.abc import Callable, Sequence
 from typing import Any, NamedTuple
@@ -72,6 +74,7 @@ from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir
 from pypto.pypto_core import passes as _passes
 
+from ._source import capture_namespaces
 from .cache import CacheKey, compute_source_hash, make_cache_key
 from .specializer import (
     DynDim,
@@ -497,8 +500,9 @@ def _get_func_def(func: Any) -> ast.FunctionDef:
     return func_def
 
 
-def _collect_all_called_names(func_def: ast.FunctionDef) -> list[str]:
-    """Return names used as bare (non-method) function calls in func_def body."""
+@functools.lru_cache(maxsize=512)
+def _collect_all_called_names(func_def: ast.FunctionDef) -> tuple[str, ...]:
+    """Cache call names from the immutable AST; resolve their bindings per call."""
     names: list[str] = []
     seen: set[str] = set()
     for node in ast.walk(func_def):
@@ -507,7 +511,7 @@ def _collect_all_called_names(func_def: ast.FunctionDef) -> list[str]:
             if name not in seen:
                 names.append(name)
                 seen.add(name)
-    return names
+    return tuple(names)
 
 
 def _collect_bind_dynamic_bindings(
@@ -700,6 +704,38 @@ class _DepBinding(NamedTuple):
 
     call_name: str
     dep: JITFunction
+
+
+@functools.lru_cache(maxsize=512)
+def _constant_dependency_names(func: Any) -> tuple[str, ...]:
+    """Find names that can supply folded constants, excluding body locals.
+
+    Match the specializer's parameter/Store-target shadowing rules. Annotation
+    names resolve in the defining namespace independently of body locals.
+    Decorators and defaults are already evaluated when the function is defined.
+    """
+    definition = _get_func_def(func)
+    local_names = {arg.arg for arg in ast.walk(definition.args) if isinstance(arg, ast.arg)}
+    local_names.update(
+        node.id
+        for node in ast.walk(definition)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    )
+    names = {
+        node.id
+        for statement in definition.body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id not in local_names
+    }
+    annotations = [arg.annotation for arg in ast.walk(definition.args) if isinstance(arg, ast.arg)]
+    annotations.append(definition.returns)
+    for annotation in annotations:
+        if annotation is None:
+            continue
+        if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+            annotation = ast.parse(annotation.value, mode="eval")
+        names.update(node.id for node in ast.walk(annotation) if isinstance(node, ast.Name))
+    return tuple(sorted(names))
 
 
 def _scan_dep_io(
@@ -1615,7 +1651,8 @@ class JITFunction:
             call_args_cache)``.  ``None`` until first ``_get_dep_graph()``
             call.  See that method for the tuple's structure.
         _cache: L1 in-memory cache: CacheKey → CompiledProgram (post-pass ir.Program wrapped).
-        _source_hash: Lazily-computed hash of func source + all dep sources.
+        _source_hash: Cached source structure hash, excluding per-call constant values.
+        _dep_bindings: Direct dependency bindings used to validate the cached graph.
     """
 
     def __init__(
@@ -1652,6 +1689,7 @@ class JITFunction:
         ) = None
         self._cache: dict[CacheKey, Any] = {}  # CacheKey → CompiledProgram
         self._source_hash: str | None = None
+        self._dep_bindings: tuple[tuple[JITFunction, ...], ...] = ()
         self._dep_layouts: tuple[tuple[str, str, str], ...] | None = None
 
         # Preserve function metadata
@@ -1713,13 +1751,9 @@ class JITFunction:
         The body transformer inlines a free ``int`` / ``float`` / ``bool`` as a
         literal, so its value is baked into the artifact — but it lives in
         ``__closure__``, not in the function text. Rebinding the cell
-        (``nonlocal rows``) therefore leaves ``source_hash`` identical, and
-        without this component the next call would be handed the previous
-        value's artifact. Same shape of problem as ``_dep_declared_layouts``.
-
-        Deliberately **not** memoized, unlike ``_dep_declared_layouts`` and
-        ``_get_source_hash``: a closure cell can be rebound over this
-        ``JITFunction``'s lifetime, which is exactly the case this guards.
+        (``nonlocal rows``) must invalidate the artifact. This legacy key
+        component is retained alongside the source dependency hash, and reads
+        the same per-call snapshot as specialization.
 
         Every foldable free variable is reported, not only those the body
         actually references. That is a superset, so it can split the cache more
@@ -1733,13 +1767,9 @@ class JITFunction:
         for func_obj in (self._func, *(dep._func for dep in self._get_deps())):
             func_name = getattr(func_obj, "__name__", "<unknown>")
             co_freevars = getattr(getattr(func_obj, "__code__", None), "co_freevars", ())
-            closure = getattr(func_obj, "__closure__", None) or ()
-            for fv_name, cell in zip(co_freevars, closure, strict=True):
-                try:
-                    value = cell.cell_contents
-                except ValueError:
-                    # Unbound cell — nothing folds, so nothing to key on.
-                    continue
+            namespace = func_name_lookup(func_obj)
+            for fv_name in co_freevars:
+                value = namespace.get(fv_name)
                 # Mirror the folder's own test so the key covers exactly what
                 # gets inlined (see _BodyTransformer.visit_Name).
                 if isinstance(value, (int, float, bool)) and not isinstance(value, type):
@@ -1756,8 +1786,9 @@ class JITFunction:
     ]:
         """Return the transitive JIT dep graph rooted at this function.
 
-        The graph is computed lazily on first access and cached for the
-        lifetime of this ``JITFunction``. Returns:
+        The graph is computed lazily and reused while its direct dependency
+        bindings remain unchanged. Rebinding a helper invalidates the graph
+        and source structure hash. Returns:
 
         - ``deps_topo``: every reachable dep in leaf-first topological order
           (deduplicated by underlying Python function identity). The entry
@@ -1784,6 +1815,13 @@ class JITFunction:
           ``None`` if the call site isn't found. Cached so metadata
           resolution doesn't re-walk caller ASTs on every JIT call.
         """
+        if self._dep_graph is not None:
+            functions = [self, *self._dep_graph[0]]
+            bindings = tuple(tuple(_discover_deps(fn._func, fn._func_type)) for fn in functions)
+            if bindings != self._dep_bindings:
+                self._dep_graph = None
+                self._source_hash = None
+                self._dep_layouts = None
         if self._dep_graph is None:
             deps_topo: list[JITFunction] = []
             seen: set[int] = set()
@@ -1827,6 +1865,9 @@ class JITFunction:
                 callees_by_func_id,
                 call_args_cache,
             )
+            self._dep_bindings = tuple(
+                tuple(_discover_deps(fn._func, fn._func_type)) for fn in [self, *deps_topo]
+            )
         return self._dep_graph
 
     def _get_deps(self) -> list[JITFunction]:
@@ -1841,7 +1882,28 @@ class JITFunction:
         """Absolute paths of the C++ source(s) backing an external kernel dep."""
         return [p for p in (self._external_aic_source, self._external_aiv_source) if p is not None]
 
+    @capture_namespaces()
     def _get_source_hash(self) -> str:
+        """Hash source structure and the current values of referenced constants."""
+        source_hash = self._get_static_source_hash()
+        records = []
+        for index, jit_func in enumerate([self, *self._get_deps()]):
+            func = jit_func._func
+            namespace = func_name_lookup(func)
+            for name in _constant_dependency_names(func):
+                value = namespace.get(name)
+                if not isinstance(value, (int, float, bool)):
+                    continue
+                if isinstance(value, bool):
+                    kind, encoded = "bool", str(value)
+                elif isinstance(value, int):
+                    kind, encoded = "int", str(value)
+                else:
+                    kind, encoded = "float", struct.pack("!d", value).hex()
+                records.append((index, func.__module__, func.__qualname__, name, kind, encoded))
+        return compute_source_hash([source_hash, json.dumps(records, separators=(",", ":"))])
+
+    def _get_static_source_hash(self) -> str:
         deps = self._get_deps()
         # External kernel .cpp files are mutable on disk, unlike the (fixed once
         # loaded) Python source. When any extern dep is present, recompute the
@@ -2137,6 +2199,7 @@ class JITFunction:
             run_config,
         )
 
+    @capture_namespaces()
     def _resolve_compiled(
         self,
         args: tuple[Any, ...],
@@ -2359,6 +2422,7 @@ class JITFunction:
         compiled, _ordered_args, _run_config = self._resolve_compiled(args, kwargs, allow_signature_mode=True)
         return compiled
 
+    @capture_namespaces()
     def specialize(self, *args: Any, **kwargs: Any) -> _ir.Program:
         """Specialize this JIT function and return its **pre-pass** IR.
 
@@ -2430,6 +2494,7 @@ class JITFunction:
         written = set(out_params) | set(inout_params)
         return tuple(p for p in self._param_names() if p in written)
 
+    @capture_namespaces()
     def lower(self, *args: Any, **kwargs: Any) -> _ir.Program:
         """Specialize this JIT function and return its post-pass IR.
 
@@ -2716,20 +2781,7 @@ def _discover_dep_bindings(func: Any, caller_func_type: str = "orchestration") -
 
     called_names = _collect_all_called_names(func_def)
 
-    # Module-level globals
-    func_globals = getattr(func, "__globals__", {})
-
-    # Closure variables (covers deps defined in an enclosing scope)
-    closure_vars: dict[str, Any] = {}
-    co_freevars = getattr(getattr(func, "__code__", None), "co_freevars", ())
-    closure = getattr(func, "__closure__", None) or ()
-    for name, cell in zip(co_freevars, closure):
-        try:
-            closure_vars[name] = cell.cell_contents
-        except ValueError:
-            pass
-
-    all_vars = {**func_globals, **closure_vars}
+    all_vars = func_name_lookup(func)
 
     allowed_dep_types: set[str] = {"incore", "inline", "opaque", "extern", "graph"}
     if caller_func_type == "host":

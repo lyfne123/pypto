@@ -49,6 +49,8 @@ from pypto.language.typing.array import Array as _LangArray
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import TensorLayout
 
+from ._source import function_namespace
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -137,14 +139,10 @@ class SpecializeContext:
             call name that differs from the function it resolves to. The body
             transformer consults it when rewriting ``kern(...)`` into
             ``self.kernel(...)``; an absent entry means the two agree.
-        py_globals: Every name visible to the originating function — its
-            ``__globals__`` merged with its closure free vars, as built by
-            :func:`func_name_lookup`. The specializer uses this to resolve
-            int/float/bool constants (``BATCH`` imported from a config module,
-            a factory's captured rank count) by inlining them at the use site.
-            Closure free vars must be included: the generated program is
-            ``exec``'d in a fresh module, so a captured name that survives
-            unfolded is undefined there (#2449).
+        py_globals: A snapshot of the originating function's globals and closure
+            bindings. During JIT compilation this is the same namespace used
+            for cache-key construction and annotation resolution. The specializer
+            inlines referenced int/float/bool constants at their use sites.
         orig_file: Path to the user's real source file (``inspect.getsourcefile``),
             or ``None`` when the function has no on-disk source (REPL / exec).
             Used to map generated diagnostics back to the user's ``.py`` (#1612).
@@ -242,16 +240,7 @@ def func_name_lookup(func: Any) -> dict[str, Any]:
     static shape resolution and body constant-folding therefore resolve against
     this mapping rather than ``__globals__`` alone.
     """
-    out: dict[str, Any] = dict(getattr(func, "__globals__", {}))
-    co_freevars = getattr(getattr(func, "__code__", None), "co_freevars", ())
-    closure = getattr(func, "__closure__", None) or ()
-    for fv_name, cell in zip(co_freevars, closure, strict=True):
-        try:
-            out[fv_name] = cell.cell_contents
-        except ValueError:
-            # Unbound closure cell — skip silently (matches _discover_deps).
-            pass
-    return out
+    return function_namespace(func)
 
 
 # ---------------------------------------------------------------------------
@@ -2173,9 +2162,6 @@ def build_specialize_context(  # noqa: PLR0913 — pass-through assembler; each 
         dep_names=dep_names,
         dep_func_names=dep_func_names or {},
         auto_scope=auto_scope,
-        # Closure-aware: a factory-defined kernel captures its constants as free
-        # vars, which never appear in __globals__. Folding must see them or they
-        # survive verbatim into the generated source and are undefined there.
         py_globals=func_name_lookup(func),
         orig_file=orig_file,
         orig_start_line=orig_start_line,

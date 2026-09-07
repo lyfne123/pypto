@@ -3014,9 +3014,9 @@ class TestClosureConstantFolding:
     def test_rebound_closure_cell_splits_the_cache(self):
         """A rebound cell must not silently reuse the previous artifact.
 
-        ``_get_source_hash`` hashes the function *text*, which a ``nonlocal``
-        rebind leaves byte-identical, so the closure values have to enter the
-        key separately. Two distinct factory instances would not catch this —
+        A ``nonlocal`` rebind leaves the function text byte-identical, so the
+        dependency hash and closure component must capture the changed value.
+        Two distinct factory instances would not catch this —
         they are different ``JITFunction`` objects with their own caches.
         """
         torch = pytest.importorskip("torch")
@@ -3028,12 +3028,13 @@ class TestClosureConstantFolding:
         del a, out
         before = entry._folded_closure_constants()
         source_hash_before = entry._get_source_hash()
+        static_hash_before = entry._get_static_source_hash()
         set_rows(96)
         after = entry._folded_closure_constants()
 
-        # The text-based hash cannot see the rebind — that is the whole problem.
-        assert entry._get_source_hash() == source_hash_before
-        # The closure component does, so the composed key differs.
+        assert entry._get_static_source_hash() == static_hash_before
+        assert entry._get_source_hash() != source_hash_before
+        # The legacy closure component also sees the captured value.
         assert before != after
         assert ("entry", "rows", "64") in before
         assert ("entry", "rows", "96") in after
