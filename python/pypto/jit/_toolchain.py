@@ -48,11 +48,14 @@ def _run(command: list[str]) -> str:
     return result.stdout + result.stderr
 
 
-def _executable(name: str) -> Path:
+def _executable(name: str, *, preserve_alias: bool = False) -> Path:
     selected = shutil.which(name)
     if selected is None:
         raise ValueError(f"Compiler executable is unavailable: {name}")
-    path = Path(selected).resolve(strict=True)
+    # Preserve argv[0]: a g++ symlink to ccache selects compiler mode, while
+    # invoking its resolved target selects ccache's management CLI instead.
+    resolved = Path(selected).resolve(strict=True)
+    path = Path(selected).absolute() if preserve_alias else resolved
     with path.open("rb") as stream:
         if stream.read(4) != b"\x7fELF":
             raise ValueError(f"Unsupported compiler launcher (requires dependency adapter): {selected}")
@@ -148,6 +151,10 @@ def _gcc_link_inputs(executable: Path) -> set[Path]:
     plan = _run(
         [str(executable), "-###", "-shared", "-fPIC", "-pthread", "-x", "c++", os.devnull, "-o", os.devnull]
     )
+    driver = re.search(r"^COLLECT_GCC=(.+)$", plan, re.MULTILINE)
+    if driver is None:
+        raise ValueError(f"Cannot discover the underlying GCC driver: {executable}")
+    paths.update(_elf_inputs(_executable(driver[1])))
     link_args = None
     for line in plan.splitlines():
         tokens = shlex.split(line)
@@ -509,9 +516,9 @@ def _discover(compiler: Any, ptoas: str, runtime_name: str) -> ToolchainInputs:
         if Path(p).exists()
     )
     orchestration = compiler._orchestration_toolchain(runtime_name)
-    device = _gcc_inputs(_executable(orchestration.cxx_path))
+    device = _gcc_inputs(_executable(orchestration.cxx_path, preserve_alias=True))
     if compiler.platform.endswith("sim"):
-        device.update(_gcc_inputs(_executable(compiler.sdk.gxx15.cxx_path)))
+        device.update(_gcc_inputs(_executable(compiler.sdk.gxx15.cxx_path, preserve_alias=True)))
     else:
         ccec = _executable(compiler.sdk.ccec.cxx_path)
         device.update(_elf_inputs(ccec))

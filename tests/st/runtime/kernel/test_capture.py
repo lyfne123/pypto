@@ -11,9 +11,12 @@
 
 import ctypes
 import importlib
+import json
 import os
 import subprocess
 import sys
+import time
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -58,12 +61,37 @@ def _configure_capture_cache(directory, case):
         os.environ["PYPTO_PROG_BUILD_DIR"] = str(Path(directory) / "generated")
         for name in ("PYPTO_CACHE", "PYPTO_CACHE_DIR", "PYPTO_CACHE_READONLY"):
             os.environ.pop(name, None)
+        os.environ["PYPTO_CACHE"] = "1"
         configure_cache(None)
+    elif case == "persistent":
+        configure_cache(CacheConfig(enabled=True, root=Path(directory) / "cache"))
     else:
-        configure_cache(CacheConfig(enabled=case == "persistent", root=Path(directory) / "cache"))
+        for name in ("PYPTO_CACHE", "PYPTO_CACHE_DIR", "PYPTO_CACHE_READONLY", "PYPTO_PROG_BUILD_DIR"):
+            os.environ.pop(name, None)
+        configure_cache(None)
 
 
-def _check_default_cache_reuse(counts, update, add, x, out, following, directory, restored):
+def _measure_first_call(invoke, directory, restored):
+    from pypto import cache_stats  # noqa: PLC0415
+
+    before = cache_stats()
+    start = time.perf_counter_ns()
+    invoke()
+    elapsed = time.perf_counter_ns() - start
+    after = cache_stats()
+    evidence = {"host_return_ns": elapsed}
+    for name in ("lookup_ns", "build_ns", "ready_hits", "generation_builds", "binary_builds", "bypasses"):
+        evidence[name] = getattr(after, name) - getattr(before, name)
+    phase = "restored" if restored else "fresh"
+    (Path(directory) / f"first-call-{phase}.json").write_text(json.dumps(evidence))
+
+
+def _record_first_calls(directory, record_property):
+    for path in sorted(Path(directory).glob("first-call-*.json")):
+        record_property(path.stem, path.read_text())
+
+
+def _check_persistent_cache_reuse(counts, update, add, x, out, following, directory, restored):
     from pypto import cache_stats  # noqa: PLC0415
     from pypto.jit._artifact_manifest import MANIFEST_NAME  # noqa: PLC0415
 
@@ -75,7 +103,7 @@ def _check_default_cache_reuse(counts, update, add, x, out, following, directory
     assert stats.ready_hits == (2 if restored else 0)
     update(x, 3.0, out)
     add(out, following, value=4)
-    assert counts == before_repeat, "default-cache hits must not compile or prepare again"
+    assert counts == before_repeat, "persistent-cache hits must not compile or prepare again"
     assert list((Path(directory) / "generated/.pypto-cache").rglob(MANIFEST_NAME))
 
 
@@ -126,7 +154,7 @@ def _run(device, directory, case, entry="jit", restored=False):
                 artifact.load()
                 assert not state._registrations
         elif not unbound and case != "cold":
-            warm_update(x, 3.0, out)
+            _measure_first_call(partial(warm_update, x, 3.0, out), directory, restored)
             if case in (
                 "multi",
                 "graphs",
@@ -141,7 +169,7 @@ def _run(device, directory, case, entry="jit", restored=False):
             ):
                 warm_add(out, following, value=4)
             if case == "build-dir":
-                _check_default_cache_reuse(
+                _check_persistent_cache_reuse(
                     counts, warm_update, warm_add, x, out, following, directory, restored
                 )
             torch_npu.npu.synchronize()
@@ -330,15 +358,17 @@ def _isolated(test_config, tmp_path, case, queue_enabled, entry, restored=False)
     ],
 )
 @pytest.mark.parametrize("queue_enabled", [0, 1])
-def test_capture(test_config, tmp_path, case, queue_enabled, entry):
+def test_capture(test_config, tmp_path, case, queue_enabled, entry, record_property):
     _isolated(test_config, tmp_path, case, queue_enabled, entry)
+    _record_first_calls(tmp_path, record_property)
 
 
 @pytest.mark.parametrize("entry", ["jit_to_ops", "ops_to_jit", "mixed"])
 @pytest.mark.parametrize("case", ["multi", "persistent", "build-dir"])
 @pytest.mark.parametrize("queue_enabled", [0, 1])
-def test_capture_entry_interop(test_config, tmp_path, entry, case, queue_enabled):
+def test_capture_entry_interop(test_config, tmp_path, entry, case, queue_enabled, record_property):
     _isolated(test_config, tmp_path, case, queue_enabled, entry)
+    _record_first_calls(tmp_path, record_property)
 
 
 if __name__ == "__main__":

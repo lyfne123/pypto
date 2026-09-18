@@ -206,19 +206,67 @@ def test_gcc_link_plan_selects_actual_inputs_only(tmp_path, monkeypatch):
     library = tmp_path / "libstdc++.so"
     plugin = tmp_path / "lto-wrapper"
     unrelated = tmp_path / "unused.so"
-    for path in (startup, library, plugin, unrelated):
+    for path in (compiler, startup, library, plugin, unrelated):
         path.write_bytes(b"\x7fELF")
 
     def run(command):
         if "-###" in command:
-            return f"/tool/collect2 {startup} -lstdc++ -plugin-opt={plugin}\n"
+            return f"COLLECT_GCC={compiler}\n/tool/collect2 {startup} -lstdc++ -plugin-opt={plugin}\n"
         if "-print-file-name=libstdc++.so" in command:
             return str(library)
         assert "-print-sysroot" in command
         return ""
 
     monkeypatch.setattr(_toolchain, "_run", run)
-    assert _toolchain._gcc_link_inputs(compiler) == {startup, library, plugin}
+    monkeypatch.setattr(_toolchain, "_elf_inputs", lambda path: {path})
+    compiler.chmod(0o755)
+    assert _toolchain._gcc_link_inputs(compiler) == {compiler, startup, library, plugin}
+
+
+def test_gcc_probes_preserve_ccache_compiler_alias(tmp_path, monkeypatch):
+    launcher = tmp_path / "ccache"
+    launcher.write_bytes(b"\x7fELFlauncher")
+    launcher.chmod(0o755)
+    alias = tmp_path / "g++"
+    alias.symlink_to(launcher)
+    driver = _toolchain._executable(str(alias), preserve_alias=True)
+    assert driver == alias
+    assert _toolchain._executable(str(alias)) == launcher
+    headers = tmp_path / "include"
+    headers.mkdir()
+    libgcc = tmp_path / "gcc/libgcc.a"
+    libgcc.parent.mkdir()
+    libgcc.touch()
+    subprograms = {}
+    for name in ("cc1plus", "collect2", "as", "ld"):
+        path = tmp_path / name
+        path.write_bytes(b"\x7fELF")
+        path.chmod(0o755)
+        subprograms[name] = path
+
+    def run(command):
+        # ccache 3.x rejects compiler flags when invoked under its own name.
+        assert command[0] == str(alias)
+        option = command[1]
+        if option == "--version":
+            return "g++ (GCC)"
+        if option.startswith("-print-prog-name="):
+            return str(subprograms[option.split("=", 1)[1]])
+        if option == "-print-libgcc-file-name":
+            return str(libgcc)
+        assert option == "-E"
+        return f"#include <...> search starts here:\n {headers}\nEnd of search list.\n"
+
+    monkeypatch.setattr(_toolchain, "_run", run)
+    monkeypatch.setattr(_toolchain, "_elf_inputs", lambda path: {path})
+    monkeypatch.setattr(_toolchain, "_gcc_link_inputs", lambda path: set())
+    assert _toolchain._gcc_inputs(driver) == {alias, headers, libgcc.parent, *subprograms.values()}
+
+
+def test_gcc_link_plan_requires_underlying_driver(monkeypatch):
+    monkeypatch.setattr(_toolchain, "_run", lambda command: "/tool/collect2 -lc")
+    with pytest.raises(ValueError, match="underlying GCC driver"):
+        _toolchain._gcc_link_inputs(Path("g++"))
 
 
 @pytest.mark.parametrize(
